@@ -53,18 +53,41 @@ _DEFAULT_NEG = (
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Model cache — keyed by (device,)
+# Model cache — keyed by str(device)
+# Models are wrapped in comfy.model_patcher.ModelPatcher so ComfyUI can evict
+# them to CPU when other nodes need VRAM and reload them when we run.
 # ─────────────────────────────────────────────────────────────────────────────
 
-_MODEL_CACHE: dict[tuple, dict] = {}
+_LOADED_MODELS: dict[str, dict] = {}
+
+
+def _estimate_bytes(module: torch.nn.Module) -> int:
+    """Rough VRAM estimate for a module (parameters + buffers)."""
+    total = 0
+    for t in (*module.parameters(), *module.buffers()):
+        if not getattr(t, 'is_meta', False):
+            total += t.numel() * t.element_size()
+    return max(total, 1)
+
+
+def _make_patcher(module: torch.nn.Module, load_device: torch.device):
+    """Wrap *module* in a ComfyUI ModelPatcher so the memory manager tracks it."""
+    import comfy.model_management as _mm
+    import comfy.model_patcher
+    return comfy.model_patcher.ModelPatcher(
+        module,
+        load_device=load_device,
+        offload_device=_mm.unet_offload_device(),
+        size=_estimate_bytes(module),
+    )
 
 
 def _load_models(device) -> dict:
-    """Load (or return cached) all four DramaBox model components."""
-    cache_key = (str(device),)
-    if cache_key in _MODEL_CACHE:
+    """Load (or return cached) all DramaBox model components as ModelPatchers."""
+    cache_key = str(device)
+    if cache_key in _LOADED_MODELS:
         logger.info("[DramaBox] Using cached models.")
-        return _MODEL_CACHE[cache_key]
+        return _LOADED_MODELS[cache_key]
 
     torch_dtype = torch.bfloat16
 
@@ -175,7 +198,31 @@ def _load_models(device) -> dict:
         warm=True,
     )
 
+    # ── Register all nn.Modules with ComfyUI model management ────────────────
+    # ComfyUI can now offload our models to CPU when other nodes need VRAM
+    # and reload them via load_models_gpu() at the start of each generate().
+    patchers = []
+
+    # Gemma text encoder (HF model inside GemmaTextEncoder wrapper)
+    _gemma_nn = getattr(prompt_encoder._warm_text_encoder, "model", None)
+    if _gemma_nn is not None:
+        patchers.append(_make_patcher(_gemma_nn, device))
+
+    # Embeddings processor
+    patchers.append(_make_patcher(prompt_encoder._warm_embeddings_processor, device))
+
+    # Audio VAE encoder
+    patchers.append(_make_patcher(audio_conditioner._warm_encoder, device))
+
+    # Transformer
+    patchers.append(_make_patcher(transformer, device))
+
+    # Audio VAE decoder + vocoder
+    patchers.append(_make_patcher(audio_decoder._warm_decoder, device))
+    patchers.append(_make_patcher(audio_decoder._warm_vocoder, device))
+
     model = {
+        "patchers":          patchers,
         "prompt_encoder":    prompt_encoder,
         "audio_conditioner": audio_conditioner,
         "transformer":       transformer,
@@ -183,8 +230,8 @@ def _load_models(device) -> dict:
         "device":            device,
         "dtype":             torch_dtype,
     }
-    _MODEL_CACHE[cache_key] = model
-    logger.info("[DramaBox] All components loaded and cached.")
+    _LOADED_MODELS[cache_key] = model
+    logger.info("[DramaBox] All components loaded and registered with ComfyUI model management.")
     return model
 
 
@@ -278,7 +325,11 @@ class DramaBoxTTS:
         device = mm.get_torch_device()
 
         # ── Load (or retrieve cached) model components ───────────────────
+        # _load_models() builds ModelPatchers on first call; subsequent calls
+        # return the cache. load_models_gpu() then ensures all our modules are
+        # on the target device — ComfyUI will offload other models if needed.
         model = _load_models(device)
+        mm.load_models_gpu(model["patchers"])
 
         opts = options or {}
         ref_duration: float  = opts.get("ref_duration", 10.0)

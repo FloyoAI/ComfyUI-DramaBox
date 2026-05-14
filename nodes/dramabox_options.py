@@ -137,18 +137,6 @@ class DramaBoxOptions:
                         ),
                     },
                 ),
-                # ── VRAM management ─────────────────────────────────────────
-                "unload_after": (
-                    "BOOLEAN",
-                    {
-                        "default": False,
-                        "tooltip": (
-                            "Unload all DramaBox models from VRAM after generation.\n"
-                            "Useful when running alongside other heavy nodes.\n"
-                            "The next generation will reload (~30 s penalty)."
-                        ),
-                    },
-                ),
             }
         }
 
@@ -170,7 +158,6 @@ class DramaBoxOptions:
         gen_duration: float = 0.0,
         duration_multiplier: float = 1.1,
         ref_duration: float = 10.0,
-        unload_after: bool = False,
     ):
         options = {
             "steps": steps,
@@ -182,7 +169,6 @@ class DramaBoxOptions:
             "gen_duration": gen_duration,
             "duration_multiplier": duration_multiplier,
             "ref_duration": ref_duration,
-            "unload_after": unload_after,
         }
         return (options,)
 

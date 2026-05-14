@@ -70,12 +70,36 @@ def _estimate_bytes(module: torch.nn.Module) -> int:
     return max(total, 1)
 
 
-def _make_patcher(module: torch.nn.Module, load_device: torch.device):
-    """Wrap *module* in a ComfyUI ModelPatcher so the memory manager tracks it."""
+class _HFModelWrapper(torch.nn.Module):
+    """Thin nn.Module shell around a HuggingFace model.
+
+    HF models (e.g. Gemma3ForConditionalGeneration) define ``device`` as a
+    read-only property.  ComfyUI's ModelPatcher sets ``model.device = ...``
+    during load/offload which raises AttributeError on such models.
+    Wrapping the HF model as a registered sub-module solves this:
+    - ModelPatcher sets .device on *this* wrapper (which has no such property)
+    - .to(device) / parameter moves still cascade to the inner HF model
+      because it is registered via self.inner
+    """
+    def __init__(self, inner: torch.nn.Module) -> None:
+        super().__init__()
+        self.inner = inner  # registered submodule — moves cascade automatically
+
+    def forward(self, *args, **kwargs):
+        return self.inner(*args, **kwargs)
+
+
+def _make_patcher(module: torch.nn.Module, load_device: torch.device, wrap_hf: bool = False):
+    """Wrap *module* in a ComfyUI ModelPatcher so the memory manager tracks it.
+
+    Set ``wrap_hf=True`` for HuggingFace models that have a read-only
+    ``device`` property so ModelPatcher can do its device-assignment bookkeeping.
+    """
     import comfy.model_management as _mm
     import comfy.model_patcher
+    target = _HFModelWrapper(module) if wrap_hf else module
     return comfy.model_patcher.ModelPatcher(
-        module,
+        target,
         load_device=load_device,
         offload_device=_mm.unet_offload_device(),
         size=_estimate_bytes(module),
@@ -204,9 +228,10 @@ def _load_models(device) -> dict:
     patchers = []
 
     # Gemma text encoder (HF model inside GemmaTextEncoder wrapper)
+    # Uses wrap_hf=True because Gemma3ForConditionalGeneration.device is read-only.
     _gemma_nn = getattr(prompt_encoder._warm_text_encoder, "model", None)
     if _gemma_nn is not None:
-        patchers.append(_make_patcher(_gemma_nn, device))
+        patchers.append(_make_patcher(_gemma_nn, device, wrap_hf=True))
 
     # Embeddings processor
     patchers.append(_make_patcher(prompt_encoder._warm_embeddings_processor, device))
@@ -280,7 +305,7 @@ class DramaBoxTTS:
             "required": {
                 "seed": (
                     "INT",
-                    {"default": 0, "min": 0, "max": 2**31 - 1},
+                    {"default": 0, "min": 0, "max": 2**31 - 1, "control_after_generate": True},
                 ),
                 "prompt": (
                     "STRING",

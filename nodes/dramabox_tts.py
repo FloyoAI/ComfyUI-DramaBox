@@ -304,6 +304,94 @@ def _load_models(device) -> dict:
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _resolve_lora_path(lora_name: str) -> str | None:
+    """Resolve a LoRA name to an absolute path via ComfyUI's folder system."""
+    import folder_paths
+    path = folder_paths.get_full_path("loras", lora_name)
+    if path and os.path.isfile(path):
+        return path
+    if os.path.isabs(lora_name) and os.path.isfile(lora_name):
+        return lora_name
+    return None
+
+
+def _apply_lora_deltas(transformer: torch.nn.Module, lora_path: str, strength: float) -> list:
+    """Apply LoRA weights to transformer in-place using manual delta math.
+
+    Handles both PEFT format (base_model.model.*) and original ID-LoRA format
+    (diffusion_model.*), matching the approach in src/inference.py.
+
+    Returns a list of (param_name, delta_tensor) so the caller can undo the
+    changes after inference by subtracting each delta.
+    """
+    from safetensors.torch import load_file as _st_load
+
+    lora_sd = _st_load(lora_path)
+    is_peft = any("base_model.model." in k for k in lora_sd)
+    is_idlora = any("diffusion_model." in k for k in lora_sd)
+
+    # Build {param_path: {"A": tensor, "B": tensor, "alpha": float}} mapping
+    pairs: dict[str, dict] = {}
+    for k, v in lora_sd.items():
+        if is_peft:
+            if "base_model.model." not in k:
+                continue
+            base = k.replace("base_model.model.", "")
+            if ".lora_A." in base:
+                pp = base[: base.index(".lora_A.")]
+                pairs.setdefault(pp, {})["A"] = v
+            elif ".lora_B." in base:
+                pp = base[: base.index(".lora_B.")]
+                pairs.setdefault(pp, {})["B"] = v
+        elif is_idlora:
+            if "diffusion_model." not in k:
+                continue
+            base = k.replace("diffusion_model.", "")
+            if ".lora_A.weight" in base:
+                pp = base.replace(".lora_A.weight", "")
+                pairs.setdefault(pp, {})["A"] = v
+            elif ".lora_B.weight" in base:
+                pp = base.replace(".lora_B.weight", "")
+                pairs.setdefault(pp, {})["B"] = v
+
+    param_dict = dict(transformer.named_parameters())
+    applied: list[tuple[str, torch.Tensor]] = []
+
+    for pp, pair in pairs.items():
+        if "A" not in pair or "B" not in pair:
+            continue
+        lora_A, lora_B = pair["A"], pair["B"]
+        rank = lora_A.shape[0]
+        scale = strength  # alpha == rank by default (scale = alpha/rank * strength = strength)
+
+        weight_key = pp + ".weight"
+        if weight_key not in param_dict:
+            continue
+
+        param = param_dict[weight_key]
+        dev, dt = param.device, param.dtype
+
+        # delta = scale * lora_B @ lora_A   (computed in float32 for precision)
+        delta = scale * (
+            lora_B.to(device=dev, dtype=torch.float32)
+            @ lora_A.to(device=dev, dtype=torch.float32)
+        ).to(dtype=dt)
+
+        param.data.add_(delta)
+        applied.append((weight_key, delta))
+
+    return applied
+
+
+def _remove_lora_deltas(transformer: torch.nn.Module, applied: list) -> None:
+    """Undo deltas previously applied by _apply_lora_deltas."""
+    param_dict = dict(transformer.named_parameters())
+    for weight_key, delta in applied:
+        if weight_key in param_dict:
+            p = param_dict[weight_key]
+            p.data.sub_(delta.to(device=p.device, dtype=p.dtype))
+
+
 def _auto_rescale(cfg: float) -> float:
     """CFG-aware std-rescale schedule (prevents clipping at high CFG)."""
     if cfg <= 2.0:
@@ -387,6 +475,10 @@ class DramaBoxTTS:
                     "DRAMABOX_OPTIONS",
                     {"tooltip": "Connect DramaBox Options for cfg, steps, duration, and more."},
                 ),
+                "lora_stack": (
+                    "LORA_STACK",
+                    {"tooltip": "Optional LoRA stack (from any LoRA stacker node). Applied to the transformer only."},
+                ),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -412,6 +504,7 @@ class DramaBoxTTS:
         prompt: str | None = None,
         voice_ref=None,
         options: dict | None = None,
+        lora_stack=None,
         unique_id=None,
     ):
         import comfy.model_management as mm
@@ -570,7 +663,24 @@ class DramaBoxTTS:
         )
 
         # ── 7. Diffusion sampling ────────────────────────────────────────
-        mm.load_models_gpu(model["xfmr_patchers"])
+        # Apply LoRAs via manual delta math (matching src/inference.py's PEFT
+        # approach). Deltas are added before moving the model to GPU and
+        # subtracted after inference so the cached transformer stays unmodified.
+        xfmr_patchers = model["xfmr_patchers"]
+        _applied_deltas: list = []  # [(weight_key, delta_tensor), …]
+        if lora_stack:
+            for lora_name, strength_model, _strength_clip in lora_stack:
+                lora_path = _resolve_lora_path(lora_name)
+                if lora_path is None:
+                    logger.warning("[DramaBox] LoRA not found, skipping: %s", lora_name)
+                    continue
+                deltas = _apply_lora_deltas(transformer, lora_path, float(strength_model))
+                _applied_deltas.extend(deltas)
+                logger.info(
+                    "[DramaBox] LoRA applied: %s (strength=%.2f, params=%d)",
+                    os.path.basename(lora_path), strength_model, len(deltas),
+                )
+        mm.load_models_gpu(xfmr_patchers)
         logger.info(
             "[DramaBox] Denoising (%d steps, cfg=%.1f, stg=%.1f)…",
             steps, cfg_scale, stg_scale,
@@ -587,6 +697,11 @@ class DramaBoxTTS:
         )
 
         mm.soft_empty_cache()
+
+        # Restore the cached transformer by undoing any LoRA deltas applied above.
+        if _applied_deltas:
+            _remove_lora_deltas(transformer, _applied_deltas)
+            _applied_deltas.clear()
 
         # ── 8. Unpatchify + end-of-clip silence-prior fix ─────────────────
         audio_state = audio_tools.clear_conditioning(audio_state)

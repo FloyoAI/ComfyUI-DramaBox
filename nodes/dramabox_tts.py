@@ -141,10 +141,14 @@ def _find_or_download_gemma_path():
         print(f"[DramaBox] Warning: preferred text encoder '{preferred}' not found — falling back to default.")
 
     # 2. Default fp4 mixed file
+    import glob as _glob
     for folder in te_dirs:
         exact = os.path.join(folder, _GEMMA_FP4_FILENAME)
         if os.path.isfile(exact):
             return exact
+        matches = _glob.glob(os.path.join(folder, "**", _GEMMA_FP4_FILENAME), recursive=True)
+        if matches:
+            return matches[0]
     target_dir = te_dirs[0]
     os.makedirs(target_dir, exist_ok=True)
     target_path = os.path.join(target_dir, _GEMMA_FP4_FILENAME)

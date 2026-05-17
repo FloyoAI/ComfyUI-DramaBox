@@ -78,76 +78,6 @@ T = TypeVar("T")
 _M = TypeVar("_M", bound=torch.nn.Module)
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-
-@contextmanager
-def _streaming_model(
-    model: _M,
-    layers_attr: str,
-    target_device: torch.device,
-    prefetch_count: int,
-) -> Iterator[_M]:
-    """Wrap *model* with :class:`LayerStreamingWrapper`, yield it, then tear down."""
-    wrapped = LayerStreamingWrapper(
-        model,
-        layers_attr=layers_attr,
-        target_device=target_device,
-        prefetch_count=prefetch_count,
-    )
-    try:
-        yield wrapped  # type: ignore[misc]
-    finally:
-        wrapped.teardown()
-        wrapped.to("meta")
-        cleanup_memory()
-        # Flush the host (pinned) memory cache so that freed pinned pages are
-        # returned to the OS.  Without this, sequential streaming models
-        # (e.g. text encoder then transformer) exhaust host memory because the
-        # CachingHostAllocator keeps freed blocks cached indefinitely.
-        torch.cuda.synchronize(device=target_device)
-        try:
-            if hasattr(torch._C, "_host_emptyCache"):
-                torch._C._host_emptyCache()
-        except Exception:
-            logger.warning("Host empty cache cleanup failed; ignoring.", exc_info=True)
-
-
-def _build_state(
-    spec: ModalitySpec,
-    tools: LatentTools,
-    noiser: Noiser,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> LatentState:
-    """Create a noised latent state from a modality spec and tools."""
-    state = create_noised_state(
-        tools=tools,
-        conditionings=spec.conditionings,
-        noiser=noiser,
-        dtype=dtype,
-        device=device,
-        noise_scale=spec.noise_scale,
-        initial_latent=spec.initial_latent,
-    )
-    if spec.frozen:
-        state = replace(state, denoise_mask=torch.zeros_like(state.denoise_mask))
-    return state
-
-
-def _cleanup_iter(it: Iterator[torch.Tensor], model: torch.nn.Module) -> Iterator[torch.Tensor]:
-    """Wrap an iterator to clean up *model* memory once it is exhausted or abandoned."""
-    with gpu_model(model):
-        yield from it
-
-
-# ---------------------------------------------------------------------------
-# DiffusionStage
-# ---------------------------------------------------------------------------
-
-
 class DiffusionStage:
     """Owns transformer lifecycle. Builds on each call, frees on exit.
     Replaces the manual ``model_ledger.transformer()`` / ``del transformer``
@@ -325,27 +255,30 @@ class PromptEncoder:
         device: torch.device,
         registry: Registry | None = None,
         warm: bool = False,
-        use_bnb_4bit: bool = False,
         audio_only: bool = False,
+        gemma_safetensors_path: str | None = None,
     ) -> None:
         self._dtype = dtype
         self._device = device
         self._warm = warm
-        self._use_bnb_4bit = use_bnb_4bit
         self._audio_only = audio_only
-
-        module_ops = module_ops_from_gemma_root(gemma_root)
-        model_folder = find_matching_file(gemma_root, "model*.safetensors").parent
-        weight_paths = [str(p) for p in model_folder.rglob("*.safetensors")]
+        self._gemma_safetensors_path = gemma_safetensors_path
 
         self._gemma_root = gemma_root
-        self._text_encoder_builder = Builder(
-            model_path=tuple(weight_paths),
-            model_class_configurator=GemmaTextEncoderConfigurator,
-            model_sd_ops=GEMMA_LLM_KEY_OPS,
-            module_ops=(GEMMA_MODEL_OPS, *module_ops),
-            registry=registry or DummyRegistry(),
-        )
+        if gemma_root is not None:
+            module_ops = module_ops_from_gemma_root(gemma_root)
+            model_folder = find_matching_file(gemma_root, "model*.safetensors").parent
+            weight_paths = [str(p) for p in model_folder.rglob("*.safetensors")]
+            self._text_encoder_builder = Builder(
+                model_path=tuple(weight_paths),
+                model_class_configurator=GemmaTextEncoderConfigurator,
+                model_sd_ops=GEMMA_LLM_KEY_OPS,
+                module_ops=(GEMMA_MODEL_OPS, *module_ops),
+                registry=registry or DummyRegistry(),
+            )
+        else:
+            self._text_encoder_builder = None
+
         self._embeddings_processor_builder = Builder(
             model_path=checkpoint_path,
             model_class_configurator=EmbeddingsProcessorConfigurator,
@@ -353,27 +286,26 @@ class PromptEncoder:
             registry=registry or DummyRegistry(),
         )
 
-        # Warm mode: build and keep models on GPU
+        # Warm mode: build and keep models ready for per-stage GPU loading.
+        # Both Gemma and embeddings processor are loaded on CPU and wrapped in
+        # a single ModelPatcher by the caller for ComfyUI GPU↔CPU management.
         self._warm_text_encoder = None
         self._warm_embeddings_processor = None
         if warm:
-            if use_bnb_4bit:
-                try:
-                    self._warm_text_encoder = self._load_bnb_4bit_encoder(gemma_root)
-                except Exception as bnb_err:
-                    logger.warning(
-                        "[DramaBox] bitsandbytes 4-bit failed (%s) — falling back to full %s load.",
-                        bnb_err, self._dtype,
-                    )
-                    self._warm_text_encoder = self._text_encoder_builder.build(
-                        device=self._device, dtype=self._dtype
-                    ).eval()
+            if gemma_safetensors_path:
+                # Single-file fp8/bfloat16 safetensors on CPU.
+                self._warm_text_encoder = self._load_gemma_hf(
+                    gemma_root, gemma_safetensors_path, dtype
+                )
             else:
+                # Multi-file HF format — load on CPU for ComfyUI patcher management.
                 self._warm_text_encoder = self._text_encoder_builder.build(
-                    device=self._device, dtype=self._dtype
+                    device=torch.device("cpu"), dtype=self._dtype
                 ).eval()
+            # Always load embeddings processor on CPU — patcher moves it to GPU.
+            ep_device = torch.device("cpu")
             built_ep = self._embeddings_processor_builder.build(
-                device=self._device, dtype=self._dtype
+                device=ep_device, dtype=self._dtype
             )
 
             # Audio-only mode: delete video components BEFORE .to(device).
@@ -415,7 +347,7 @@ class PromptEncoder:
                     fe.video_aggregate_embed = _DummyVideoEmbed(out_features)
 
             # Now move the (post-strip) module onto the target device.
-            self._warm_embeddings_processor = built_ep.to(self._device).eval()
+            self._warm_embeddings_processor = built_ep.to(ep_device).eval()
 
             if audio_only and self._warm_embeddings_processor is not None:
                 ep = self._warm_embeddings_processor
@@ -443,93 +375,78 @@ class PromptEncoder:
                 import gc; gc.collect()
                 _log.info(f"Audio-only mode: freed video components, saved {freed/1e9:.1f}GB VRAM")
 
-    def _load_bnb_4bit_encoder(self, gemma_root: str):
-        """Load Gemma with bitsandbytes 4-bit quantization for reduced VRAM.
+    def _load_gemma_hf(self, gemma_root, safetensors_path, dtype):
+        """Load Gemma weights from a single fp8/bfloat16 safetensors file on CPU.
 
-        Auto-detects whether the checkpoint at ``gemma_root`` is already
-        pre-quantized (has ``quantization_config`` in ``config.json``) — in
-        that case we skip our explicit ``BitsAndBytesConfig`` and let
-        transformers honour the checkpoint's own quantization metadata.
-        Passing our own config on top of a pre-quantized checkpoint causes
-        shape mismatches when transformers tries to quantize already-packed
-        4-bit weights a second time.
+        The returned GemmaTextEncoder has all parameters on CPU.  Caller is
+        responsible for wrapping it in a ComfyUI ModelPatcher so that
+        load_models_gpu() / free_memory() handle GPU↔CPU migration per stage.
+
+        Key remapping (single-file → HF Gemma3ForConditionalGeneration):
+          ``model.*``        → ``language_model.model.*``
+          ``vision_model.*`` → ``vision_tower.vision_model.*``
         """
-        import json
-        import logging
-        import os
-        from transformers import Gemma3ForConditionalGeneration, BitsAndBytesConfig
+        from pathlib import Path as _Path
+        from transformers import Gemma3ForConditionalGeneration, Gemma3Config
+        from safetensors.torch import load_file as _st_load
         from ltx_core.text_encoders.gemma.tokenizer import LTXVGemmaTokenizer
         from ltx_core.text_encoders.gemma.encoders.base_encoder import GemmaTextEncoder
 
-        # Quick smoke-test: will raise immediately if bnb native library is broken
-        try:
-            import bitsandbytes as _bnb
-            _bnb.functional.get_4bit_type("nf4")  # triggers native lib if broken
-        except Exception as e:
-            raise RuntimeError(f"bitsandbytes not functional: {e}") from e
+        # Bundled config + tokenizer — never touch HuggingFace, same pattern as LTXVideo.
+        _bundled = _Path(__file__).parent.parent.parent.parent / "gemma_configs"
+        logger.info("[DramaBox] Building Gemma architecture from bundled config: %s", _bundled)
+        config = Gemma3Config.from_json_file(str(_bundled / "gemma3cfg.json"))
+        config._attn_implementation = "sdpa"
 
-        # Inspect config.json for an existing quantization_config.
-        prequantized = False
-        cfg_path = os.path.join(gemma_root, "config.json")
-        if os.path.exists(cfg_path):
-            try:
-                with open(cfg_path) as f:
-                    cfg = json.load(f)
-                prequantized = "quantization_config" in cfg
-            except Exception:
-                pass
+        with torch.device("meta"):
+            hf_model = Gemma3ForConditionalGeneration(config)
 
-        from_kwargs = {
-            "device_map": str(self._device),
-            "torch_dtype": self._dtype,
-        }
-        if prequantized:
-            logging.info(
-                "Loading pre-quantized Gemma (bnb-4bit) — using checkpoint's own quantization_config"
+        logger.info("[DramaBox] Loading Gemma weights from: %s", safetensors_path)
+        raw_sd = _st_load(safetensors_path, device="cpu")
+
+        # Remap single-file keys to HF Gemma3ForConditionalGeneration namespace.
+        remapped = {}
+        for k, v in raw_sd.items():
+            if k.startswith("model."):
+                remapped["language_model." + k] = v.to(dtype)
+            elif k.startswith("vision_model."):
+                remapped["vision_tower." + k] = v.to(dtype)
+            else:
+                remapped[k] = v.to(dtype)
+
+        missing, unexpected = hf_model.load_state_dict(remapped, strict=False, assign=True)
+        if missing:
+            logger.info(
+                "[DramaBox] Gemma fp8 load: %d missing keys (vision/proj components expected)",
+                len(missing),
             )
-        else:
-            logging.info("Loading Gemma with runtime bitsandbytes 4-bit quantization...")
-            from_kwargs["quantization_config"] = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=self._dtype,
-            )
-        # Try attention implementations in priority order, falling back to sdpa
-        # which is always available via PyTorch's native F.scaled_dot_product_attention.
-        _attn_candidates = []
-        try:
-            import flash_attn as _fa
-            _fa_ver = tuple(int(x) for x in _fa.__version__.split(".")[:2])
-            if _fa_ver >= (2, 7):
-                _attn_candidates.append("flash_attention_3")
-            _attn_candidates.append("flash_attention_2")
-        except ImportError:
-            pass
-        _attn_candidates.append(None)   # None = transformers auto (xformers / default)
-        _attn_candidates.append("sdpa") # guaranteed fallback
+        if unexpected:
+            logger.debug("[DramaBox] Gemma fp8 load: %d unexpected keys", len(unexpected))
 
-        hf_model = None
-        for _attn_impl in _attn_candidates:
-            try:
-                _kwargs = dict(from_kwargs)
-                if _attn_impl is not None:
-                    _kwargs["attn_implementation"] = _attn_impl
-                hf_model = Gemma3ForConditionalGeneration.from_pretrained(gemma_root, **_kwargs)
-                logging.info("Gemma loaded with attn_implementation=%r", _attn_impl or "auto")
-                break
-            except Exception as _attn_err:
-                logging.warning(
-                    "Gemma load with attn_implementation=%r failed (%s) — trying next",
-                    _attn_impl or "auto", _attn_err,
-                )
-        if hf_model is None:
-            raise RuntimeError("Gemma failed to load with all attention implementations.")
-        tokenizer = LTXVGemmaTokenizer(
-            str(find_matching_file(gemma_root, "tokenizer.model").parent), 1024
-        )
-        encoder = GemmaTextEncoder(model=hf_model, tokenizer=tokenizer, dtype=self._dtype)
-        mem_gb = torch.cuda.memory_allocated(self._device) / 1e9
-        logging.info(f"Gemma 4-bit loaded: {mem_gb:.1f}GB VRAM")
+        # Materialize any remaining meta tensors (vision tower, multi-modal
+        # projector, etc.) that were absent from the fp8 file.
+        # ComfyUI's ModelPatcher calls model.to(device) which raises
+        # "Cannot copy out of meta tensor" if any params are still on meta.
+        _n_meta = 0
+        for mod in hf_model.modules():
+            for pname, param in list(mod._parameters.items()):
+                if param is not None and param.is_meta:
+                    mod._parameters[pname] = torch.nn.Parameter(
+                        torch.empty(param.shape, dtype=param.dtype, device="cpu"),
+                        requires_grad=False,
+                    )
+                    _n_meta += 1
+            for bname, buf in list(mod._buffers.items()):
+                if buf is not None and buf.is_meta:
+                    mod._buffers[bname] = torch.zeros(buf.shape, dtype=buf.dtype, device="cpu")
+                    _n_meta += 1
+        if _n_meta:
+            logger.info("[DramaBox] Materialized %d meta tensors (vision/proj not in fp8 file)", _n_meta)
+
+        tokenizer = LTXVGemmaTokenizer(str(_bundled), 1024)
+        encoder = GemmaTextEncoder(model=hf_model, tokenizer=tokenizer, dtype=dtype)
+        size_gb = sum(p.numel() * p.element_size() for p in encoder.parameters()) / 1e9
+        logger.info("[DramaBox] Gemma loaded from safetensors on CPU: %.1f GB", size_gb)
         return encoder
 
     def _text_encoder_ctx(

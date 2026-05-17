@@ -72,6 +72,23 @@ app.registerExtension({
     nodeCreated(node) {
         if (node.comfyClass !== NODE_NAME) return;
 
+        // Give the node a comfortable initial height on first creation only.
+        // onConfigure fires synchronously (before rAF) when loading a saved
+        // workflow and sets the flag, so saved sizes are always respected.
+        requestAnimationFrame(() => {
+            if (!node._configuredFromWorkflow) {
+                node.size[1] = Math.max(node.size[1], 500);
+                node.setDirtyCanvas(true, true);
+            }
+        });
+
+        // Mark as loaded-from-workflow so the rAF above is suppressed.
+        const _origConfigure = node.onConfigure?.bind(node);
+        node.onConfigure = function (info) {
+            node._configuredFromWorkflow = true;
+            _origConfigure?.(info);
+        };
+
         // Set pointerEvents once so the textarea always scrolls,
         // even before the first sync (matches PM behaviour).
         setTimeout(() => {
@@ -132,5 +149,25 @@ api.addEventListener("dramabox-tts-update", (event) => {
 
     // Re-apply ghost in case the sync arrives before onConnectionsChange settles
     refreshGhost(node);
+});
+
+// ── DramaBox settings ────────────────────────────────────────────────────────
+
+app.registerExtension({
+    name: "DramaBox.Settings",
+    settings: [
+        {
+            id: "DramaBox.defaultTextEncoder",
+            name: "Default Text Encoder filename",
+            category: ["DramaBox", "Text Encoder", "Default"],
+            type: "text",
+            defaultValue: "",
+            tooltip:
+                "Filename of the Gemma safetensors to auto-load (must exist in your " +
+                "text_encoders folder). Leave blank to use gemma_3_12B_it_fp4_mixed.safetensors " +
+                "(downloaded automatically on first use). Connect a DramaBox CLIP Loader node " +
+                "to override per-workflow.",
+        },
+    ],
 });
 

@@ -7,9 +7,9 @@ DramaBox weights (~8.5 GB) download automatically from HuggingFace on first use 
         dramabox-dit-v1.safetensors
         dramabox-audio-components.safetensors
         silence_latent_frame.pt
-    ComfyUI/models/dramabox/gemma-3-12b-it-bnb-4bit/
-        <full snapshot>
 
+Gemma 3 12B weights are loaded from ComfyUI/models/text_encoders/ (fp8 safetensors)
+or from a full HuggingFace snapshot in ComfyUI/models/dramabox/.
 Existing weights in the old node-local models/ folder are migrated automatically.
 Once present, files are loaded directly — no HuggingFace API calls on startup.
 
@@ -55,6 +55,8 @@ for _sub in ("src", "ltx2"):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from .dramabox_clip import DramaBoxTextEncoderLoader  # noqa: E402
+
 # Use ComfyUI's central models folder so weights are shared with other nodes.
 # Fall back to the node-local models/ dir when running outside ComfyUI.
 try:
@@ -71,12 +73,107 @@ _DEFAULT_NEG = (
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Model cache — keyed by str(device)
-# Models are wrapped in comfy.model_patcher.ModelPatcher so ComfyUI can evict
-# them to CPU when other nodes need VRAM and reload them when we run.
+# Model caches — keyed by str(device)
+#
+# _LOADED_MODELS:        audio VAE (conditioner + decoder) + transformer
+# _LOADED_TEXT_ENCODER:  Gemma + embeddings processor (text encoder only)
+#
+# Both caches are wrapped in ModelPatcher so ComfyUI moves them GPU↔CPU
+# automatically per generation stage.  The text encoder lives in a separate
+# cache so an external DRAMABOX_CLIP can be used without reloading everything.
 # ─────────────────────────────────────────────────────────────────────────────
 
 _LOADED_MODELS: dict[str, dict] = {}
+_LOADED_TEXT_ENCODER: dict[str, dict] = {}
+
+
+_GEMMA_FP4_FILENAME  = "gemma_3_12B_it_fp4_mixed.safetensors"
+_GEMMA_FP4_REPO      = "Comfy-Org/ltx-2"
+_GEMMA_FP4_REPO_PATH = "split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors"
+
+
+def _get_dramabox_setting(key, default=None):
+    """Read a value from ComfyUI's persisted user settings JSON."""
+    try:
+        import json
+        import folder_paths as _fp
+        settings_path = os.path.join(_fp.base_path, "user", "default", "comfy.settings.json")
+        if os.path.isfile(settings_path):
+            with open(settings_path, encoding="utf-8") as _f:
+                return json.load(_f).get(key, default)
+    except Exception:
+        pass
+    return default
+
+def _find_or_download_gemma_path():
+    """Return a local path to the default Gemma safetensors.
+
+    Resolution order:
+      1. User preference set in ComfyUI Settings → DramaBox → Default Text Encoder.
+      2. ``gemma_3_12B_it_fp4_mixed.safetensors`` in any ``text_encoders`` folder.
+      3. Auto-download ``gemma_3_12B_it_fp4_mixed.safetensors`` from ``Comfy-Org/ltx-2``.
+
+    To use a different model per-workflow, connect a DramaBox CLIP Loader node.
+    """
+    import shutil
+    try:
+        import folder_paths as _fp
+        te_dirs = _fp.get_folder_paths("text_encoders")
+    except Exception:
+        te_dirs = [os.path.join(_MODELS_DIR, "text_encoders")]
+
+    # 1. User preference from ComfyUI settings
+    preferred = (_get_dramabox_setting("DramaBox.defaultTextEncoder") or "").strip()
+    if preferred:
+        for folder in te_dirs:
+            candidate = os.path.join(folder, preferred)
+            if os.path.isfile(candidate):
+                return candidate
+        raise FileNotFoundError(
+            f"[DramaBox] Preferred text encoder '{preferred}' not found in any text_encoders folder. "
+            "Update the filename in ComfyUI Settings → DramaBox, or clear it to use the default."
+        )
+
+    # 2. Default fp4 mixed file
+    for folder in te_dirs:
+        exact = os.path.join(folder, _GEMMA_FP4_FILENAME)
+        if os.path.isfile(exact):
+            return exact
+    target_dir = te_dirs[0]
+    os.makedirs(target_dir, exist_ok=True)
+    target_path = os.path.join(target_dir, _GEMMA_FP4_FILENAME)
+    print(f"[DramaBox] Gemma not found — downloading {_GEMMA_FP4_FILENAME} from {_GEMMA_FP4_REPO} …")
+    from huggingface_hub import snapshot_download
+    import logging as _logging
+    _httpx_log = _logging.getLogger("httpx")
+    _prev = _httpx_log.level
+    _httpx_log.setLevel(_logging.WARNING)
+    try:
+        snapshot_download(
+            repo_id=_GEMMA_FP4_REPO,
+            allow_patterns=[_GEMMA_FP4_REPO_PATH],
+            local_dir=target_dir,
+            token=os.environ.get("HF_TOKEN"),
+        )
+    finally:
+        _httpx_log.setLevel(_prev)
+    # snapshot_download places the file at local_dir/repo_path; move it flat
+    dl_path = os.path.join(target_dir, _GEMMA_FP4_REPO_PATH)
+    if os.path.isfile(dl_path) and os.path.abspath(dl_path) != os.path.abspath(target_path):
+        shutil.move(dl_path, target_path)
+    # Remove leftover subdirs created by huggingface_hub
+    for leftover in ("split_files", ".cache"):
+        d = os.path.join(target_dir, leftover)
+        if os.path.isdir(d):
+            shutil.rmtree(d, ignore_errors=True)
+    if os.path.isfile(target_path):
+        print(f"[DramaBox] Downloaded: {target_path}")
+        return target_path
+    raise FileNotFoundError(
+        f"[DramaBox] Failed to download {_GEMMA_FP4_FILENAME}. "
+        "Place it manually in your ComfyUI/models/text_encoders/ folder, "
+        "or connect a DramaBox CLIP Loader node to supply the text encoder."
+    )
 
 
 def _estimate_bytes(module: torch.nn.Module) -> int:
@@ -88,41 +185,41 @@ def _estimate_bytes(module: torch.nn.Module) -> int:
     return max(total, 1)
 
 
-class _HFModelWrapper(torch.nn.Module):
-    """Thin nn.Module shell around a HuggingFace model.
-
-    HF models (e.g. Gemma3ForConditionalGeneration) define ``device`` as a
-    read-only property.  ComfyUI's ModelPatcher sets ``model.device = ...``
-    during load/offload which raises AttributeError on such models.
-    Wrapping the HF model as a registered sub-module solves this.
-    """
-    def __init__(self, inner: torch.nn.Module) -> None:
-        super().__init__()
-        self.inner = inner  # registered submodule — moves cascade automatically
-
-    def forward(self, *args, **kwargs):
-        return self.inner(*args, **kwargs)
-
-
-def _make_patcher(module: torch.nn.Module, load_device: torch.device, wrap_hf: bool = False):
+def _make_patcher(module: torch.nn.Module, load_device: torch.device):
     """Wrap *module* in a ComfyUI ModelPatcher so the memory manager tracks it."""
     import comfy.model_management as _mm
     import comfy.model_patcher
-    target = _HFModelWrapper(module) if wrap_hf else module
     return comfy.model_patcher.ModelPatcher(
-        target,
+        module,
         load_device=load_device,
         offload_device=_mm.unet_offload_device(),
         size=_estimate_bytes(module),
     )
 
 
-def _load_models(device) -> dict:
-    """Load DramaBox model components with sequential CPU-offload initialisation.
+class _DramaBoxTextBundle(torch.nn.Module):
+    """Single nn.Module wrapping Gemma + embeddings processor.
 
-    Each sub-model is loaded to CPU (offload_device) where possible so only
-    one large model lives in VRAM at a time.  Gemma is an exception: bnb-4bit
-    weights require CUDA and cannot be moved to CPU after loading.
+    Treated as one unit by ComfyUI's ModelPatcher so both models move
+    GPU↔CPU together as a single eviction unit — matching how LTXVideo
+    wraps CLIP text encoders inside comfy.sd.CLIP.
+    """
+
+    def __init__(self, text_encoder, embeddings_processor):
+        super().__init__()
+        self.text_encoder = text_encoder
+        self.embeddings_processor = embeddings_processor
+
+
+def _load_models(device) -> dict:
+    """Load the audio VAE, transformer, and audio decoder with CPU-offload.
+
+    All components are moved to GPU per-stage via mm.load_models_gpu().
+    ComfyUI's free_memory() evicts each stage's models back to CPU when the
+    next stage loads, so only one large model occupies VRAM at a time.
+
+    The Gemma text encoder is NOT loaded here — it is handled separately by
+    _load_text_encoder() or supplied via a DRAMABOX_CLIP input.
     """
     import comfy.model_management as mm
 
@@ -135,29 +232,14 @@ def _load_models(device) -> dict:
     torch_dtype = torch.bfloat16
 
     # -- Resolve weight paths (local-first via patched model_downloader) -------
-    from model_downloader import get_model_path, get_gemma_path
+    from model_downloader import get_model_path
     logger.info("[DramaBox] Resolving model weights…")
     ckpt_transformer = get_model_path("transformer",      cache_dir=_MODELS_DIR)
     ckpt_audio       = get_model_path("audio_components", cache_dir=_MODELS_DIR)
-    gemma_root       = get_gemma_path(cache_dir=_MODELS_DIR)
 
-    from ltx_pipelines.utils.blocks import PromptEncoder, AudioConditioner, AudioDecoder
+    from ltx_pipelines.utils.blocks import AudioConditioner, AudioDecoder
 
-    # ── 1. PromptEncoder (Gemma bnb-4bit) — must live on GPU ─────────────────
-    # bitsandbytes 4-bit weights use CUDA kernels and cannot be .to('cpu').
-    logger.info("[DramaBox] Loading PromptEncoder (Gemma, GPU — bnb-4bit)…")
-    prompt_encoder = PromptEncoder(
-        checkpoint_path=ckpt_audio,
-        gemma_root=gemma_root,
-        dtype=torch_dtype,
-        device=device,
-        warm=True,
-        use_bnb_4bit=True,
-        audio_only=True,
-    )
-    mm.soft_empty_cache()
-
-    # ── 2. AudioConditioner (VAE encoder) — load to CPU ──────────────────────
+    # ── 1. AudioConditioner (VAE encoder) — load to CPU ──────────────────────
     logger.info("[DramaBox] Loading AudioConditioner (CPU)…")
     try:
         audio_conditioner = AudioConditioner(
@@ -176,7 +258,7 @@ def _load_models(device) -> dict:
         )
     mm.soft_empty_cache()
 
-    # ── 3. Transformer (LTX audio-only DiT) — build on CPU ───────────────────
+    # ── 2. Transformer (LTX audio-only DiT) — build on CPU ───────────────────
     logger.info("[DramaBox] Loading Transformer (CPU)…")
     from safetensors import safe_open
     from ltx_core.loader.registry import DummyRegistry
@@ -254,7 +336,7 @@ def _load_models(device) -> dict:
     logger.info("[DramaBox] Transformer: %.1fB params", n_params)
     mm.soft_empty_cache()
 
-    # ── 4. AudioDecoder (VAE decoder + vocoder) — load to CPU ────────────────
+    # ── 3. AudioDecoder (VAE decoder + vocoder) — load to CPU ────────────────
     logger.info("[DramaBox] Loading AudioDecoder (CPU)…")
     try:
         audio_decoder = AudioDecoder(
@@ -274,34 +356,20 @@ def _load_models(device) -> dict:
     mm.soft_empty_cache()
 
     # ── Build stage-specific patcher groups ───────────────────────────────────
-    # text_patchers  : Gemma text encoder + embeddings processor (step 5)
     # voice_patchers : audio VAE encoder (step 3, optional)
     # xfmr_patchers  : diffusion transformer (step 7)
     # dec_patchers   : audio VAE decoder + vocoder (step 9)
-    text_patchers = []
-    _gemma_nn = getattr(prompt_encoder._warm_text_encoder, "model", None)
-    if _gemma_nn is not None:
-        text_patchers.append(_make_patcher(_gemma_nn, device, wrap_hf=True))
-    text_patchers.append(_make_patcher(prompt_encoder._warm_embeddings_processor, device))
-
     voice_patchers = [_make_patcher(audio_conditioner._warm_encoder, device)]
-
-    xfmr_patchers = [_make_patcher(transformer, device)]
-
-    dec_patchers = [
+    xfmr_patchers  = [_make_patcher(transformer, device)]
+    dec_patchers   = [
         _make_patcher(audio_decoder._warm_decoder, device),
         _make_patcher(audio_decoder._warm_vocoder, device),
     ]
 
-    all_patchers = text_patchers + voice_patchers + xfmr_patchers + dec_patchers
-
     model = {
-        "patchers":          all_patchers,
-        "text_patchers":     text_patchers,
         "voice_patchers":    voice_patchers,
         "xfmr_patchers":     xfmr_patchers,
         "dec_patchers":      dec_patchers,
-        "prompt_encoder":    prompt_encoder,
         "audio_conditioner": audio_conditioner,
         "transformer":       transformer,
         "audio_decoder":     audio_decoder,
@@ -309,8 +377,29 @@ def _load_models(device) -> dict:
         "dtype":             torch_dtype,
     }
     _LOADED_MODELS[cache_key] = model
-    logger.info("[DramaBox] All components loaded (Gemma on GPU, others on CPU).")
+    logger.info("[DramaBox] Non-text components loaded (audio VAE, transformer, decoder).")
     return model
+
+
+def _load_text_encoder(device):
+    """Auto-load the DramaBox Gemma text encoder as a standard ComfyUI CLIP.
+
+    Uses DramaBoxTextEncoderLoader so the fallback path is identical to the
+    connected-CLIP path — both go through DramaBoxTEModel + ModelPatcher.
+    Result is cached; pass ``device='cpu'`` to force CPU offload.
+    """
+    cache_key = str(device)
+    if cache_key in _LOADED_TEXT_ENCODER:
+        return _LOADED_TEXT_ENCODER[cache_key]
+
+    from .dramabox_clip import DramaBoxTextEncoderLoader
+
+    gemma_path = _find_or_download_gemma_path()
+
+    clip_device = "cpu" if str(device) == "cpu" else "default"
+    (clip,) = DramaBoxTextEncoderLoader().load(gemma_path, clip_device)
+    _LOADED_TEXT_ENCODER[cache_key] = clip
+    return clip
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -418,6 +507,52 @@ def _auto_rescale(cfg: float) -> float:
     return min(1.0, 0.8 + 0.1 * (cfg - 8.0))
 
 
+def _unload_dramabox_models():
+    """Free all DramaBox model weights from GPU and CPU RAM.
+
+    Unpatches all ComfyUI-managed ModelPatchers (moving them to CPU), removes
+    them from current_loaded_models, then clears _LOADED_MODELS so GC can
+    reclaim memory.  After this call the next DramaBox TTS generation will
+    reload everything from disk.
+    """
+    import gc
+    import comfy.model_management as mm
+
+    if not _LOADED_MODELS and not _LOADED_TEXT_ENCODER:
+        logger.info("[DramaBox] No models loaded — nothing to free.")
+        return
+
+    # Collect all internally-managed patchers (external CLIP is user-managed)
+    all_patchers = []
+    for clip in _LOADED_TEXT_ENCODER.values():
+        try:
+            all_patchers.append(clip.patcher)
+        except AttributeError:
+            pass
+    for model in _LOADED_MODELS.values():
+        # ── 1. Move ComfyUI-managed patchers back to CPU ──────────────────
+        for group in ("voice_patchers", "xfmr_patchers", "dec_patchers"):
+            all_patchers.extend(model.get(group, []))
+
+    for patcher in all_patchers:
+        try:
+            patcher.unpatch_model(patcher.offload_device)
+        except Exception as e:
+            logger.debug("[DramaBox] unpatch_model failed: %s", e)
+
+    # ── 2. Remove patchers from ComfyUI's tracking list ──────────────────
+    patcher_set = set(id(p) for p in all_patchers)
+    mm.current_loaded_models[:] = [
+        m for m in mm.current_loaded_models if id(m.model) not in patcher_set
+    ]
+
+    _LOADED_MODELS.clear()
+    _LOADED_TEXT_ENCODER.clear()
+    gc.collect()
+    mm.soft_empty_cache()
+    logger.info("[DramaBox] All models unloaded. VRAM freed.")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Node
 # ─────────────────────────────────────────────────────────────────────────────
@@ -436,8 +571,8 @@ class DramaBoxTTS:
         "All weights (DramaBox + Gemma) auto-download on first use.\n"
         "Optionally connect any audio source as voice_ref to clone a voice."
     )
-    RETURN_TYPES = ("AUDIO", "STRING")
-    RETURN_NAMES = ("audio", "info")
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
     FUNCTION = "generate"
 
     @classmethod
@@ -492,6 +627,10 @@ class DramaBoxTTS:
                     "LORA_STACK",
                     {"tooltip": "Optional LoRA stack (from any LoRA stacker node). Applied to the transformer only."},
                 ),
+                "dramabox_clip": (
+                    "CLIP",
+                    {"tooltip": "Pre-loaded text encoder from DramaBox Text Encoder Loader. Skips internal Gemma loading when connected."},
+                ),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -518,6 +657,7 @@ class DramaBoxTTS:
         voice_ref=None,
         options: dict | None = None,
         lora_stack=None,
+        dramabox_clip=None,
         unique_id=None,
     ):
         import comfy.model_management as mm
@@ -539,7 +679,8 @@ class DramaBoxTTS:
         # ── Load (or retrieve cached) model components ───────────────────
         # _load_models() builds ModelPatchers on first call; subsequent calls
         # return the cache. load_models_gpu() is called per-stage so only one
-        # set of weights occupies VRAM at a time.
+        # large model occupies VRAM at a time; ComfyUI evicts the previous
+        # stage's weights to CPU automatically.
         model = _load_models(device)
 
         opts = options or {}
@@ -556,7 +697,11 @@ class DramaBoxTTS:
             _auto_rescale(cfg_scale) if rescale_raw == "auto" else float(rescale_raw)
         )
 
-        prompt_enc  = model["prompt_encoder"]
+        # ── Resolve text encoder (external CLIP or auto-loaded CLIP) ───────────
+        # Both paths produce a standard comfy.sd.CLIP — same encoding code runs
+        # regardless of whether the user connected a DramaBoxTextEncoderLoader.
+        _clip_enc = dramabox_clip if dramabox_clip is not None else _load_text_encoder(device)
+
         audio_cond  = model["audio_conditioner"]
         transformer = model["transformer"]
         decoder     = model["audio_decoder"]
@@ -650,12 +795,16 @@ class DramaBoxTTS:
         state = GaussianNoiser(generator=gen)(state, noise_scale=1.0)
 
         # ── 5. Encode text prompts ───────────────────────────────────────
-        mm.load_models_gpu(model["text_patchers"])
+        # _clip_enc is always a comfy.sd.CLIP — either user-supplied or auto-loaded.
         logger.info("[DramaBox] Encoding prompts…")
-        prompts = [used_prompt, negative_prompt] if cfg_scale > 1.0 else [used_prompt]
-        ctx = prompt_enc(prompts, streaming_prefetch_count=None)
-        a_ctx     = ctx[0].audio_encoding
-        a_ctx_neg = ctx[1].audio_encoding if cfg_scale > 1.0 else None
+        tokens_pos = _clip_enc.tokenize(used_prompt)
+        cond_pos   = _clip_enc.encode_from_tokens(tokens_pos, return_dict=True)
+        a_ctx      = cond_pos["dramabox_audio_encoding"].to(torch_dtype)
+        a_ctx_neg  = None
+        if cfg_scale > 1.0:
+            tokens_neg = _clip_enc.tokenize(negative_prompt)
+            cond_neg   = _clip_enc.encode_from_tokens(tokens_neg, return_dict=True)
+            a_ctx_neg  = cond_neg["dramabox_audio_encoding"].to(torch_dtype)
         mm.soft_empty_cache()
 
         # ── 6. Build denoiser ────────────────────────────────────────────
@@ -748,21 +897,57 @@ class DramaBoxTTS:
         audio_dur = waveform.shape[-1] / sample_rate
         elapsed = time.time() - t_total
 
-        info = (
-            f"Generated {audio_dur:.1f}s of audio in {elapsed:.1f}s "
-            f"| {sample_rate} Hz | {steps} steps "
-            f"| cfg={cfg_scale} stg={stg_scale} | seed={seed}"
-        )
-        logger.info("[DramaBox] %s", info)
+        return ({"waveform": waveform, "sample_rate": sample_rate},)
 
-        return ({"waveform": waveform, "sample_rate": sample_rate}, info)
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DramaBoxFreeVRAM:
+    """Unload all DramaBox models from GPU and CPU RAM.
+
+    Add this node after your last DramaBox TTS node when switching to other
+    workflows that need the VRAM.  The next DramaBox generation will reload
+    from disk automatically.
+    """
+
+    CATEGORY = "DramaBox"
+    DESCRIPTION = (
+        "Unload all DramaBox models (Gemma + transformer + audio components) from "
+        "GPU and CPU RAM.  Connect after your last DramaBox TTS node when switching "
+        "to other workflows.  Models reload automatically on next use."
+    )
+    RETURN_TYPES = ("STRING", "AUDIO")
+    RETURN_NAMES = ("status", "audio")
+    FUNCTION = "free_vram"
+    OUTPUT_NODE = True
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {},
+            "optional": {
+                "audio": ("AUDIO", {"tooltip": "Connect to chain this node after DramaBox TTS"}),
+            },
+        }
+
+    def free_vram(self, audio=None):
+        import comfy.model_management as mm
+        before = mm.get_free_memory()
+        _unload_dramabox_models()
+        after = mm.get_free_memory()
+        freed_mb = max(0, after - before) / (1024 * 1024)
+        status = f"DramaBox models unloaded. Freed ~{freed_mb:.0f} MB VRAM."
+        logger.info("[DramaBox] %s", status)
+        return (status, audio)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 NODE_CLASS_MAPPINGS = {
-    "DramaBoxTTS": DramaBoxTTS,
+    "DramaBoxTTS":       DramaBoxTTS,
+    "DramaBoxFreeVRAM":  DramaBoxFreeVRAM,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "DramaBoxTTS": "DramaBox TTS",
+    "DramaBoxTTS":      "DramaBox TTS",
+    "DramaBoxFreeVRAM": "DramaBox Free VRAM",
 }

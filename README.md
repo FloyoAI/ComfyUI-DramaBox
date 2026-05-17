@@ -7,7 +7,18 @@ ComfyUI custom nodes for [DramaBox](https://github.com/resemble-ai/DramaBox) —
 | Node | Description |
 |------|-------------|
 | **DramaBox TTS** | Generates speech audio from a text prompt. Optionally accepts a voice reference clip and advanced options. All model weights are downloaded automatically on first use. |
-| **DramaBox Options** | Advanced generation settings (steps, CFG scale, duration, etc.). Connect to the DramaBox TTS node's `options` input. |
+| **DramaBox CLIP Loader** | Loads a Gemma text encoder from your `text_encoders` folder. (Optional) Connect to the TTS node's `dramabox_clip` input to override the default encoder. |
+| **DramaBox Options** | Advanced generation settings (steps, CFG scale, duration, etc.). (Optional) Connect to the DramaBox TTS node's `options` input. |
+
+## Text Encoder
+
+DramaBox uses a Gemma 3 12B text encoder. By default the node loads **`gemma_3_12B_it_fp4_mixed.safetensors`** — the same file used by ComfyUI's own LTX-2 workflows, so if you already have it you're good to go. If it is not present it is downloaded automatically into your `ComfyUI/models/text_encoders/` folder on first use.
+
+### Changing the default encoder
+
+**Per-installation preference** — open *ComfyUI Settings → DramaBox → Default Text Encoder filename* and enter the filename of any Gemma safetensors already in your `text_encoders` folder (e.g. `gemma_3_12b_it_fp8_scaled.safetensors`). Leave it blank to keep the fp4 default.
+
+**Per-workflow override** — add a **DramaBox CLIP Loader** node, select the model you want, and connect its output to the TTS node's `dramabox_clip` input. This takes precedence over the global preference and lets you switch encoders between workflows without touching settings.
 
 <div align="center">
   <img src="docs/images/example.png" alt="DramaBox">
@@ -55,42 +66,17 @@ Voice LoRAs for DramaBox can be trained with **[Voice Clone Studio — DramaBox 
    pip install -r requirements.txt
    ```
 
-6. On first run, the node will automatically download all model weights into `custom_nodes/ComfyUI-DramaBox/models/`.
+6. On first run, the node will automatically download DramaBox model weights into `ComfyUI/models/dramabox/`.
 
-### bitsandbytes on newer CUDA versions (13.x)
+## Changelog
 
-The released `bitsandbytes` packages only ship pre-compiled CUDA binaries up to a certain version. If your CUDA toolkit is newer (e.g. 13.2) you will see an error like:
-
-```
-bitsandbytes library load error: Configured CUDA binary not found at …libbitsandbytes_cuda132.dll
-```
-
-### Fix — build bitsandbytes from source
-
-You need NVCC installed (part of the [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads)) and matching the CUDA version used by your PyTorch build. Then run these commands inside your ComfyUI venv:
-
-```powershell
-# Activate your ComfyUI virtual environment (See Above):
-# 1. Install the build prerequisites 
-pip install scikit-build-core cmake ninja
-
-# 2. Build bitsandbytes from source with the CUDA backend
-$env:CMAKE_ARGS = "-DCOMPUTE_BACKEND=cuda"
-pip install "git+https://github.com/bitsandbytes-foundation/bitsandbytes.git" --no-build-isolation --force-reinstall
-```
-
-The build takes a few minutes. When it completes you should see a `libbitsandbytes_cudaXXX.dll` in your site-packages. Verify it works:
-
-```powershell
-python -c "import bitsandbytes as bnb; bnb.functional.get_4bit_type('nf4'); print('OK', bnb.__version__)"
-```
-
-**Note:** the `--force-reinstall` flag will also reinstall PyTorch to satisfy bitsandbytes' dependency resolver. If it downgrades torch, restore your original version afterwards:
-
-```powershell
-pip install "torch==<your-version>+cu<xyz>" --index-url https://download.pytorch.org/whl/nightly/cu<xyz> --no-deps
-```
-Replace `<your-version>` and `<xyz>` with your actual torch version and CUDA tag (e.g. `2.13.0.dev20260507+cu132` / `cu132`).
+### May 2026
+- **Text encoder overhaul** — DramaBox now uses ComfyUI's standard CLIP infrastructure for the Gemma text encoder, matching the native LTX-2 loading path for correct VRAM management.
+- **Default encoder** — switched to `gemma_3_12B_it_fp4_mixed.safetensors` (ComfyUI/Comfy-Org's own quantized file, ~8 GB vs ~24 GB for the previous bnb-4bit snapshot). Downloaded automatically into `text_encoders/` on first use if not already present.
+- **DramaBox CLIP Loader node** — new optional node to load any Gemma safetensors from `text_encoders/`. Connect to the TTS node's `dramabox_clip` input for per-workflow encoder selection.
+- **Settings preference** — added *ComfyUI Settings → DramaBox → Default Text Encoder filename* to set a global default without needing a CLIP Loader node in every workflow.
+- **Old Gemma snapshot cleanup** — the large `gemma-3-12b-it-bnb-4bit/` model directory (previously downloaded into `models/dramabox/`) is automatically removed on startup since it is no longer needed.
+- **Removed info output** — the `info` string output has been removed from the DramaBox TTS node.
 
 ## Credits
 

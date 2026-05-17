@@ -16,17 +16,10 @@ import logging
 logger = logging.getLogger(__name__)
 
 try:
-    from .nodes.dramabox_tts import (
-        NODE_CLASS_MAPPINGS as _TTS_CLS,
-        NODE_DISPLAY_NAME_MAPPINGS as _TTS_DISP,
+    from .nodes import (
+        NODE_CLASS_MAPPINGS,
+        NODE_DISPLAY_NAME_MAPPINGS,
     )
-    from .nodes.dramabox_options import (
-        NODE_CLASS_MAPPINGS as _OPT_CLS,
-        NODE_DISPLAY_NAME_MAPPINGS as _OPT_DISP,
-    )
-
-    NODE_CLASS_MAPPINGS = {**_TTS_CLS, **_OPT_CLS}
-    NODE_DISPLAY_NAME_MAPPINGS = {**_TTS_DISP, **_OPT_DISP}
 
     logger.info("[ComfyUI-DramaBox] Nodes registered: %s", list(NODE_CLASS_MAPPINGS.keys()))
 

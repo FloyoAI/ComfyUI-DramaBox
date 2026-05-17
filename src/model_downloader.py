@@ -177,6 +177,20 @@ def migrate_old_layout(models_dir):
             except Exception:
                 pass
 
+    # ── Remove old Gemma model directories (replaced by fp8 safetensors) ────────
+    # The full bnb-4bit snapshot is no longer needed — DramaBox now loads Gemma
+    # from a standard fp8 safetensors in the text_encoders folder.
+    old_gemma_dirs = [
+        models_dir / "dramabox" / gemma_name,          # migrated location
+        old_gemma_cache,                                # HF blob cache
+        _NODE_MODELS_DIR / "dramabox" / gemma_name,    # node-local dramabox/
+        _NODE_MODELS_DIR / gemma_name,                  # old node-local top-level
+    ]
+    for gemma_dir in old_gemma_dirs:
+        if gemma_dir.is_dir():
+            logger.info(f"[DramaBox] Removing old Gemma directory (no longer needed): {gemma_dir}")
+            shutil.rmtree(str(gemma_dir), ignore_errors=True)
+
     if migrated:
         logger.info(f"[DramaBox] Migration complete. Items moved: {migrated}")
     return migrated
@@ -289,13 +303,14 @@ def get_all_paths(cache_dir=None):
             'transformer':      '/path/to/dramabox/dramabox-dit-v1.safetensors',
             'audio_components': '/path/to/dramabox/dramabox-audio-components.safetensors',
             'silence_latent':   '/path/to/dramabox/silence_latent_frame.pt',
-            'gemma_root':       '/path/to/gemma-3-12b-it-bnb-4bit/',
         }
+
+    Note: Gemma is no longer downloaded here. The ComfyUI node loads Gemma from
+    an fp8 safetensors placed in the text_encoders folder by the user.
     """
     paths = {}
     for name in MODEL_FILES:
         paths[name] = get_model_path(name, cache_dir)
-    paths["gemma_root"] = get_gemma_path(cache_dir)
     return paths
 
 

@@ -94,6 +94,20 @@ class DramaBoxOptions:
                         ),
                     },
                 ),
+                "id_guidance_scale": (
+                    "FLOAT",
+                    {
+                        "default": 3.0,
+                        "min": 0.0,
+                        "max": 10.0,
+                        "step": 0.1,
+                        "tooltip": (
+                            "Identity guidance scale for voice-cloning fidelity.\n"
+                            "Higher values push the output closer to the reference voice identity.\n"
+                            "0.0 = disabled.  Default: 3.0."
+                        ),
+                    },
+                ),
                 # ── Duration ────────────────────────────────────────────────
                 "gen_duration": (
                     "FLOAT",
@@ -120,6 +134,20 @@ class DramaBoxOptions:
                             "Scale factor applied to the auto-estimated duration.\n"
                             "1.1 = 10% extra breathing room (default).\n"
                             "Ignored when gen_duration > 0."
+                        ),
+                    },
+                ),
+                "speed": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.1,
+                        "max": 3.0,
+                        "step": 0.05,
+                        "tooltip": (
+                            "Speaking rate multiplier for auto duration estimation.\n"
+                            "1.0 = normal pace.  0.7 = slower / more deliberate.\n"
+                            "1.3 = faster.  Ignored when gen_duration > 0."
                         ),
                     },
                 ),
@@ -155,8 +183,10 @@ class DramaBoxOptions:
         cfg_scale: float = 2.5,
         stg_scale: float = 1.5,
         rescale_scale: float = -1.0,
+        id_guidance_scale: float = 3.0,
         gen_duration: float = 0.0,
         duration_multiplier: float = 1.1,
+        speed: float = 1.0,
         ref_duration: float = 10.0,
     ):
         options = {
@@ -166,8 +196,10 @@ class DramaBoxOptions:
             "stg_scale": stg_scale,
             # -1.0 sentinel → pass "auto" string to TTSServer.generate()
             "rescale_scale": "auto" if rescale_scale < 0.0 else float(rescale_scale),
+            "id_guidance_scale": id_guidance_scale,
             "gen_duration": gen_duration,
             "duration_multiplier": duration_multiplier,
+            "speed": speed,
             "ref_duration": ref_duration,
         }
         return (options,)

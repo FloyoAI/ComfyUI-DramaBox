@@ -546,6 +546,7 @@ class DramaBoxTTS:
         ref_duration: float  = opts.get("ref_duration", 10.0)
         gen_duration: float  = opts.get("gen_duration", 0.0)
         duration_mult: float = opts.get("duration_multiplier", 1.1)
+        speed: float         = float(opts.get("speed", 1.0))
         steps: int           = int(opts.get("steps", 30))
         cfg_scale: float     = float(opts.get("cfg_scale", 2.5))
         stg_scale: float     = float(opts.get("stg_scale", 1.5))
@@ -583,7 +584,7 @@ class DramaBoxTTS:
         if gen_duration and gen_duration > 0:
             gen_dur = float(gen_duration)
         else:
-            gen_dur = round(estimate_speech_duration(used_prompt) * duration_mult, 1)
+            gen_dur = round(estimate_speech_duration(used_prompt, speed) * duration_mult, 1)
         fps = 25.0
         n_frames = int(round(gen_dur * fps)) + 1
         n_frames = ((n_frames - 1 + 4) // 8) * 8 + 1

@@ -24,7 +24,7 @@ import os
 import shutil
 from pathlib import Path
 
-from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub import snapshot_download
 
 logger = logging.getLogger(__name__)
 
@@ -212,14 +212,14 @@ def get_model_path(name, cache_dir=None):
         return str(local_path)
 
     dramabox_dir.mkdir(parents=True, exist_ok=True)
-    logger.info(f"[DramaBox] Downloading {name} from {DRAMABOX_REPO}/{repo_filename}…")
+    print(f"[DramaBox] Downloading {name} ({Path(repo_filename).name}) from HuggingFace...")
     _httpx_log = logging.getLogger("httpx")
     _prev = _httpx_log.level
     _httpx_log.setLevel(logging.WARNING)
     try:
-        hf_hub_download(
+        snapshot_download(
             repo_id=DRAMABOX_REPO,
-            filename=repo_filename,
+            allow_patterns=[repo_filename],
             local_dir=str(dramabox_dir),
             token=os.environ.get("HF_TOKEN"),
         )
@@ -229,7 +229,7 @@ def get_model_path(name, cache_dir=None):
     cache_dir_path = dramabox_dir / ".cache"
     if cache_dir_path.is_dir():
         shutil.rmtree(str(cache_dir_path), ignore_errors=True)
-    logger.info(f"[DramaBox]   -> {local_path}")
+    print(f"[DramaBox] Done: {local_path}")
     return str(local_path)
 
 
@@ -259,7 +259,9 @@ def get_gemma_path(cache_dir=None):
         return str(local_dir)
 
     local_dir.mkdir(parents=True, exist_ok=True)
-    logger.info(f"[DramaBox] Downloading Gemma from {GEMMA_REPO} to {local_dir}…")
+    print(f"[DramaBox] Downloading Gemma ({GEMMA_REPO}) from HuggingFace...")
+
+    print(f"[DramaBox] Destination: {local_dir}")
     _httpx_log = logging.getLogger("httpx")
     _prev = _httpx_log.level
     _httpx_log.setLevel(logging.WARNING)
@@ -275,7 +277,7 @@ def get_gemma_path(cache_dir=None):
     cache_dir_path = local_dir / ".cache"
     if cache_dir_path.is_dir():
         shutil.rmtree(str(cache_dir_path), ignore_errors=True)
-    logger.info(f"[DramaBox]   -> {local_dir}")
+    print(f"[DramaBox] Done: {local_dir}")
     return str(local_dir)
 
 

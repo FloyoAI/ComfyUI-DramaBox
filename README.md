@@ -24,7 +24,7 @@ LoRAs and voice reference samples work independently and can be used together. A
 
 ### Training your own voice LoRAs
 
-Voice LoRAs for DramaBox can be trained with **[Voice Clone Studio — DramaBox Edition](https://github.com/FranckyB/Voice-Clone-Studio-DramaBox)**, a dedicated training and inference UI for the DramaBox model. Record or import a few minutes of a target voice, run the trainer, and drop the resulting `.safetensors` file into ComfyUI's `models/loras/` folder.
+Voice LoRAs for DramaBox can be trained with **[Voice Clone Studio — DramaBox Edition](https://github.com/FranckyB/Voice-Clone-Studio-DramaBox)**, a stripped-down version of Voice Clone Studio, made for DramaBox, for both inference and LoRA training. It provides a dataset creator that automatically transcribes and splits your long audio clips into smaller clips ready to be used by the trainer. Drop the resulting `.safetensors` file into ComfyUI's `models/loras/` folder.
 
 ## Installation
 

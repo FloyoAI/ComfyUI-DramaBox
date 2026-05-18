@@ -226,6 +226,18 @@ class DramaBoxOptions:
                         ),
                     },
                 ),
+                "generation_mode": (
+                    ["clip_loader", "dramabox_wrapper"],
+                    {
+                        "default": "clip_loader",
+                        "advanced": True,
+                        "tooltip": (
+                            "Generation path selection:\n"
+                            "clip_loader: Comfy CLIP/GGUF-friendly path with strong VRAM management (default).\n"
+                            "dramabox_wrapper: use the original DramaBox warm TTSServer path for closer OG behavior."
+                        ),
+                    },
+                ),
             }
         }
 
@@ -250,6 +262,7 @@ class DramaBoxOptions:
         ref_duration: float = 10.0,
         post_generate_model_policy: str = "",
         attention_policy: str = "best_available",
+        generation_mode: str = "clip_loader",
     ):
         valid_policies = {"keep_loaded", "offload_to_cpu", "offload"}
         if post_generate_model_policy not in valid_policies:
@@ -266,6 +279,11 @@ class DramaBoxOptions:
         if attention_policy not in valid_attention_policies:
             attention_policy = "best_available"
 
+        valid_generation_modes = {"clip_loader", "dramabox_wrapper"}
+        generation_mode = str(generation_mode).strip().lower()
+        if generation_mode not in valid_generation_modes:
+            generation_mode = "clip_loader"
+
         options = {
             "steps": steps,
             "negative_prompt": negative_prompt,
@@ -280,6 +298,7 @@ class DramaBoxOptions:
             "ref_duration": ref_duration,
             "post_generate_model_policy": str(post_generate_model_policy),
             "attention_policy": attention_policy,
+            "generation_mode": generation_mode,
         }
         return (options,)
 

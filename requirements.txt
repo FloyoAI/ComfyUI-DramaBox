@@ -3,3 +3,4 @@
 ltx-core
 ltx-pipelines
 soundfile>=0.12.0
+bitsandbytes>=0.45.0

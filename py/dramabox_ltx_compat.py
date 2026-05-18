@@ -3,6 +3,9 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
+import gc
+import logging
+import types
 from typing import TypeVar
 
 import torch
@@ -17,10 +20,19 @@ from ltx_core.guidance.perturbations import (
     PerturbationType,
 )
 from ltx_core.loader.registry import DummyRegistry, Registry
+from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
 from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
+from ltx_core.text_encoders.gemma import (
+    EMBEDDINGS_PROCESSOR_KEY_OPS,
+    GEMMA_LLM_KEY_OPS,
+    GEMMA_MODEL_OPS,
+    EmbeddingsProcessorConfigurator,
+    GemmaTextEncoderConfigurator,
+    module_ops_from_gemma_root,
+)
 from ltx_core.model.transformer import Modality, X0Model
 from ltx_core.types import Audio, LatentState
-from ltx_core.utils import to_denoised, to_velocity
+from ltx_core.utils import find_matching_file, to_denoised, to_velocity
 from ltx_pipelines.utils.helpers import (
     cleanup_memory,
     generate_enhanced_prompt,
@@ -30,6 +42,161 @@ from ltx_pipelines.utils.model_ledger import ModelLedger
 
 _M = TypeVar("_M", bound=torch.nn.Module)
 _T = TypeVar("_T")
+logger = logging.getLogger(__name__)
+
+
+def _ensure_rope_factor_compat() -> None:
+    """Install a vendored-style Gemma encoder mutator that avoids rope factor crashes."""
+    try:
+        from ltx_core.text_encoders.gemma.encoders import encoder_configurator as _enc_cfg
+    except Exception:
+        return
+
+    if getattr(_enc_cfg, "_dramabox_vendored_gemma_compat", False):
+        return
+
+    def _resolve_rope_meta(config):
+        rope_params = getattr(config, "rope_parameters", {}) or {}
+        full = rope_params.get("full_attention", {}) if isinstance(rope_params, dict) else {}
+        if not isinstance(full, dict):
+            full = {}
+
+        default_theta = getattr(config, "default_theta", {}) or {}
+        rope_theta = full.get("rope_theta")
+        if rope_theta is None and isinstance(rope_params, dict):
+            rope_theta = rope_params.get("rope_theta")
+        if rope_theta is None:
+            rope_theta = default_theta.get("global", default_theta.get("local", 10000.0))
+
+        rope_type = full.get("rope_type")
+        if rope_type is None and isinstance(rope_params, dict):
+            rope_type = rope_params.get("rope_type")
+        if rope_type is None:
+            rope_scaling = getattr(config, "rope_scaling", None)
+            if isinstance(rope_scaling, dict):
+                rope_type = rope_scaling.get("rope_type")
+        if rope_type is None:
+            rope_type = "default"
+
+        factor = full.get("factor")
+        if factor is None and isinstance(rope_params, dict):
+            factor = rope_params.get("factor")
+        if factor is None:
+            factor = 1.0
+
+        partial_rotary_factor = full.get("partial_rotary_factor")
+        if partial_rotary_factor is None and isinstance(rope_params, dict):
+            partial_rotary_factor = rope_params.get("partial_rotary_factor")
+        if partial_rotary_factor is None:
+            partial_rotary_factor = 1.0
+
+        return {
+            "rope_type": str(rope_type),
+            "rope_theta": float(rope_theta),
+            "factor": float(factor),
+            "partial_rotary_factor": float(partial_rotary_factor),
+        }
+
+    def _compute_inv_freq(config):
+        head_dim = getattr(config, "head_dim", None)
+        if head_dim is None:
+            head_dim = config.hidden_size // config.num_attention_heads
+
+        rope_meta = _resolve_rope_meta(config)
+        dim = int(head_dim * rope_meta["partial_rotary_factor"])
+        if dim <= 0:
+            dim = int(head_dim)
+        if dim % 2 != 0:
+            dim -= 1
+        if dim <= 0:
+            dim = int(head_dim)
+
+        inv_freq = 1.0 / (
+            rope_meta["rope_theta"]
+            ** (torch.arange(0, dim, 2, dtype=torch.int64, device="cpu").to(dtype=torch.float) / dim)
+        )
+
+        if rope_meta["rope_type"] == "linear":
+            inv_freq = inv_freq / max(rope_meta["factor"], 1e-8)
+
+        return inv_freq, rope_meta
+
+    def _create_and_populate_vendored(module):
+        model = module.model
+        vision_tower = model.model.vision_tower
+        v_model = getattr(vision_tower, "vision_model", vision_tower)
+        l_model = model.model.language_model
+
+        config = model.config.text_config
+        dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+
+        rope_params = getattr(config, "rope_parameters", {}) or {}
+        sliding = rope_params.get("sliding_attention", {}) if isinstance(rope_params, dict) else {}
+        if not isinstance(sliding, dict):
+            sliding = {}
+
+        default_theta = getattr(config, "default_theta", {"local": 10000.0})
+        base = getattr(config, "rope_local_base_freq", None)
+        if base is None:
+            base = sliding.get("rope_theta", default_theta.get("local", 10000.0))
+
+        local_rope_freqs = 1.0 / (
+            float(base) ** (torch.arange(0, dim, 2, dtype=torch.int64, device="cpu").to(dtype=torch.float) / dim)
+        )
+
+        inv_freqs, rope_meta = _compute_inv_freq(config)
+
+        try:
+            merged_rope_scaling = dict(getattr(config, "rope_scaling", {}) or {})
+            merged_rope_scaling.setdefault("rope_type", rope_meta["rope_type"])
+            merged_rope_scaling.setdefault("factor", rope_meta["factor"])
+            merged_rope_scaling.setdefault("rope_theta", rope_meta["rope_theta"])
+            setattr(config, "rope_scaling", merged_rope_scaling)
+        except Exception:
+            pass
+
+        positions_length = len(v_model.embeddings.position_ids[0])
+        position_ids = torch.arange(positions_length, dtype=torch.long, device="cpu").unsqueeze(0)
+        v_model.embeddings.register_buffer("position_ids", position_ids)
+        embed_scale = torch.tensor(model.config.text_config.hidden_size**0.5, device="cpu")
+        l_model.embed_tokens.register_buffer("embed_scale", embed_scale)
+
+        if hasattr(l_model, "rotary_emb_local") and l_model.rotary_emb_local is not None:
+            l_model.rotary_emb_local.register_buffer("inv_freq", local_rope_freqs)
+
+        if hasattr(l_model, "rotary_emb") and l_model.rotary_emb is not None:
+            l_model.rotary_emb.register_buffer("inv_freq", inv_freqs)
+
+        return module
+
+    _enc_cfg.create_and_populate = _create_and_populate_vendored
+
+    try:
+        from ltx_core.loader.module_ops import ModuleOps
+        import ltx_core.text_encoders.gemma as _gemma_pkg
+        import ltx_pipelines.utils.model_ledger as _ledger_mod
+
+        old_ops = getattr(_ledger_mod, "GEMMA_MODEL_OPS", None)
+        if old_ops is None:
+            old_ops = getattr(_gemma_pkg, "GEMMA_MODEL_OPS", None)
+        if old_ops is None:
+            old_ops = getattr(_enc_cfg, "GEMMA_MODEL_OPS", None)
+
+        if old_ops is not None:
+            new_ops = ModuleOps(
+                name=getattr(old_ops, "name", "GemmaModel"),
+                matcher=getattr(old_ops, "matcher"),
+                mutator=_create_and_populate_vendored,
+            )
+
+            # Patch every place that may have captured GEMMA_MODEL_OPS by value.
+            _enc_cfg.GEMMA_MODEL_OPS = new_ops
+            _gemma_pkg.GEMMA_MODEL_OPS = new_ops
+            _ledger_mod.GEMMA_MODEL_OPS = new_ops
+    except Exception:
+        pass
+
+    _enc_cfg._dramabox_vendored_gemma_compat = True
 
 
 @contextmanager
@@ -141,21 +308,186 @@ class PromptEncoder:
         audio_only: bool = False,
     ) -> None:
         self._warm = warm
-        self._ledger = ModelLedger(
-            dtype=dtype,
-            device=device,
-            checkpoint_path=checkpoint_path,
-            gemma_root_path=gemma_root,
-            registry=registry or DummyRegistry(),
-        )
-        self._warm_text_encoder = None
-        self._warm_embeddings_processor = None
+        self._dtype = dtype
+        self._device = device
         self._use_bnb_4bit = use_bnb_4bit
         self._audio_only = audio_only
+        _ensure_rope_factor_compat()
+
+        registry = registry or DummyRegistry()
+        module_ops = module_ops_from_gemma_root(gemma_root)
+        model_folder = find_matching_file(gemma_root, "model*.safetensors").parent
+        weight_paths = [str(p) for p in model_folder.rglob("*.safetensors")]
+
+        self._text_encoder_builder = Builder(
+            model_path=tuple(weight_paths),
+            model_class_configurator=GemmaTextEncoderConfigurator,
+            model_sd_ops=GEMMA_LLM_KEY_OPS,
+            module_ops=(GEMMA_MODEL_OPS, *module_ops),
+            registry=registry,
+        )
+        self._embeddings_processor_builder = Builder(
+            model_path=checkpoint_path,
+            model_class_configurator=EmbeddingsProcessorConfigurator,
+            model_sd_ops=EMBEDDINGS_PROCESSOR_KEY_OPS,
+            registry=registry,
+        )
+
+        self._warm_text_encoder = None
+        self._warm_embeddings_processor = None
 
         if warm:
-            self._warm_text_encoder = self._ledger.text_encoder()
-            self._warm_embeddings_processor = self._ledger.gemma_embeddings_processor()
+            if use_bnb_4bit:
+                self._warm_text_encoder = self._load_bnb_4bit_encoder(gemma_root)
+            else:
+                self._warm_text_encoder = self._text_encoder_builder.build(
+                    device=self._device,
+                    dtype=self._dtype,
+                ).eval()
+
+            built_ep = self._embeddings_processor_builder.build(
+                device=torch.device("cpu"),
+                dtype=self._dtype,
+            )
+            self._warm_embeddings_processor = self._prepare_embeddings_processor(built_ep)
+
+    def _prepare_embeddings_processor(self, embeddings_processor):
+        if embeddings_processor is None:
+            return None
+
+        if not self._audio_only:
+            return embeddings_processor.to(device=self._device, dtype=self._dtype).eval()
+
+        ep = embeddings_processor
+        freed = 0
+
+        if getattr(ep, "video_connector", None) is not None:
+            try:
+                freed += sum(
+                    p.numel() * p.element_size()
+                    for p in ep.video_connector.parameters()
+                    if not p.is_meta
+                )
+            except Exception:
+                pass
+            del ep.video_connector
+            ep.video_connector = None
+
+        fe = getattr(ep, "feature_extractor", None)
+        if fe is not None and getattr(fe, "video_aggregate_embed", None) is not None:
+            try:
+                freed += sum(
+                    p.numel() * p.element_size()
+                    for p in fe.video_aggregate_embed.parameters()
+                    if not p.is_meta
+                )
+            except Exception:
+                pass
+            out_features = getattr(fe.video_aggregate_embed, "out_features", 1)
+            del fe.video_aggregate_embed
+
+            class _DummyVideoEmbed(torch.nn.Module):
+                def __init__(self, out_f):
+                    super().__init__()
+                    self.out_features = out_f
+
+                def forward(self, x):
+                    return torch.zeros(
+                        x.shape[0],
+                        x.shape[1],
+                        self.out_features,
+                        device=x.device,
+                        dtype=x.dtype,
+                    )
+
+            fe.video_aggregate_embed = _DummyVideoEmbed(out_features)
+
+        if fe is not None and getattr(fe, "audio_aggregate_embed", None) is not None:
+            def _forward_audio_only(self, hidden_states, attention_mask, padding_side="left"):
+                from ltx_core.text_encoders.gemma.feature_extractor import (
+                    _rescale_norm,
+                    norm_and_concat_per_token_rms,
+                )
+
+                encoded = (
+                    torch.stack(hidden_states, dim=-1)
+                    if isinstance(hidden_states, (list, tuple))
+                    else hidden_states
+                )
+                normed = norm_and_concat_per_token_rms(encoded, attention_mask).to(encoded.dtype)
+                a_dim = self.audio_aggregate_embed.out_features
+                audio = self.audio_aggregate_embed(_rescale_norm(normed, a_dim, self.embedding_dim))
+                video = audio.new_zeros((audio.shape[0], audio.shape[1], 1))
+                return video, audio
+
+            fe.forward = types.MethodType(_forward_audio_only, fe)
+
+        def _audio_only_create(video_features, audio_features, additive_attention_mask, _ep=ep):
+            m = additive_attention_mask
+            while m.dim() > 2:
+                m = m[:, 0]
+
+            binary_mask = (m >= -1.0).to(torch.int64)
+            audio_encoded = None
+            if _ep.audio_connector is not None:
+                audio_encoded, _ = _ep.audio_connector(audio_features, additive_attention_mask)
+
+            return video_features, audio_encoded, binary_mask
+
+        ep.create_embeddings = _audio_only_create
+
+        ep = ep.to(device=self._device, dtype=self._dtype).eval()
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        if freed:
+            logger.info("[DramaBox] Audio-only mode: freed video components, saved %.2f GB VRAM", freed / 1e9)
+
+        return ep
+
+    def _load_bnb_4bit_encoder(self, gemma_root: str):
+        import json
+        import os
+        from transformers import BitsAndBytesConfig, Gemma3ForConditionalGeneration
+        from ltx_core.text_encoders.gemma.encoders.base_encoder import GemmaTextEncoder
+        from ltx_core.text_encoders.gemma.tokenizer import LTXVGemmaTokenizer
+
+        try:
+            import bitsandbytes as _bnb
+
+            _bnb.functional.get_4bit_type("nf4")
+        except Exception as exc:
+            raise RuntimeError(f"bitsandbytes not functional: {exc}") from exc
+
+        prequantized = False
+        cfg_path = os.path.join(gemma_root, "config.json")
+        if os.path.exists(cfg_path):
+            try:
+                with open(cfg_path, encoding="utf-8") as f:
+                    cfg = json.load(f)
+                prequantized = "quantization_config" in cfg
+            except Exception:
+                prequantized = False
+
+        from_kwargs = {
+            "device_map": str(self._device),
+            "torch_dtype": self._dtype,
+        }
+        if not prequantized:
+            from_kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=self._dtype,
+            )
+
+        hf_model = Gemma3ForConditionalGeneration.from_pretrained(gemma_root, **from_kwargs)
+        tokenizer = LTXVGemmaTokenizer(
+            str(find_matching_file(gemma_root, "tokenizer.model").parent),
+            1024,
+        )
+        return GemmaTextEncoder(model=hf_model, tokenizer=tokenizer, dtype=self._dtype)
 
     def __call__(
         self,
@@ -167,15 +499,17 @@ class PromptEncoder:
         streaming_prefetch_count: int | None = None,
     ):
         del streaming_prefetch_count
-        del self._use_bnb_4bit
-        del self._audio_only
+
+        _ensure_rope_factor_compat()
 
         if self._warm and self._warm_text_encoder is not None and self._warm_embeddings_processor is not None:
             return self._encode(prompts, self._warm_text_encoder, self._warm_embeddings_processor,
                                 enhance_first_prompt, enhance_prompt_image, enhance_prompt_seed)
 
-        with gpu_model(self._ledger.text_encoder()) as text_encoder, gpu_model(
-            self._ledger.gemma_embeddings_processor()
+        with gpu_model(self._text_encoder_builder.build(device=self._device, dtype=self._dtype).eval()) as text_encoder, gpu_model(
+            self._prepare_embeddings_processor(
+                self._embeddings_processor_builder.build(device=torch.device("cpu"), dtype=self._dtype)
+            )
         ) as embeddings_processor:
             return self._encode(
                 prompts,

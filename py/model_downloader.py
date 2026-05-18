@@ -218,20 +218,6 @@ def migrate_old_layout(models_dir):
             except Exception:
                 pass
 
-    # ── Remove old Gemma model directories (replaced by fp8 safetensors) ────────
-    # The full bnb-4bit snapshot is no longer needed — DramaBox now loads Gemma
-    # from a standard fp8 safetensors in the text_encoders folder.
-    old_gemma_dirs = [
-        models_dir / "dramabox" / gemma_name,          # migrated location
-        old_gemma_cache,                                # HF blob cache
-        _NODE_MODELS_DIR / "dramabox" / gemma_name,    # node-local dramabox/
-        _NODE_MODELS_DIR / gemma_name,                  # old node-local top-level
-    ]
-    for gemma_dir in old_gemma_dirs:
-        if gemma_dir.is_dir():
-            logger.info(f"[DramaBox] Removing old Gemma directory (no longer needed): {gemma_dir}")
-            shutil.rmtree(str(gemma_dir), ignore_errors=True)
-
     if migrated:
         logger.info(f"[DramaBox] Migration complete. Items moved: {migrated}")
     return migrated

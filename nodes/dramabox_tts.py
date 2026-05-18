@@ -92,6 +92,8 @@ _DEFAULT_NEG = (
 
 _LOADED_MODELS: dict[str, dict] = {}
 _LOADED_TEXT_ENCODER: dict[str, dict] = {}
+_OG_SERVER_CACHE: dict[str, object] = {}
+_DRAMABOX_WRAPPER_COMPAT_APPLIED = False
 
 
 _GEMMA_FP4_FILENAME  = "gemma_3_12B_it_fp4_mixed.safetensors"
@@ -759,6 +761,280 @@ def _unload_dramabox_models():
     logger.info("[DramaBox] All models unloaded. VRAM freed.")
 
 
+def _normalize_generation_mode(mode) -> str:
+    mode = str(mode).strip().lower()
+    if mode in {"clip_loader", "dramabox_wrapper"}:
+        return mode
+    return "clip_loader"
+
+
+def _apply_dramabox_wrapper_compat(force: bool = False) -> None:
+    """Apply runtime compatibility shims used by DramaBox_Wrapper mode."""
+    global _DRAMABOX_WRAPPER_COMPAT_APPLIED
+    if _DRAMABOX_WRAPPER_COMPAT_APPLIED and not force:
+        return
+
+    try:
+        from transformers.models.siglip.modeling_siglip import SiglipVisionModel
+
+        if not hasattr(SiglipVisionModel, "vision_model"):
+            # ltx_core expects vision_tower.vision_model in some versions.
+            SiglipVisionModel.vision_model = property(lambda self: self)
+            logger.info("[DramaBox] DramaBox_Wrapper compat: patched SiglipVisionModel.vision_model")
+    except Exception as exc:
+        logger.debug("[DramaBox] DramaBox_Wrapper compat patch skipped: %s", exc)
+
+    try:
+        from transformers.models.gemma3.configuration_gemma3 import Gemma3TextConfig
+
+        def _rope_local_base_freq(self):
+            rope_params = getattr(self, "rope_parameters", {}) or {}
+            sliding = rope_params.get("sliding_attention", {}) or {}
+            default_theta = getattr(self, "default_theta", {"local": 10000.0})
+            return float(sliding.get("rope_theta", default_theta.get("local", 10000.0)))
+
+        def _rope_scaling(self):
+            rope_params = getattr(self, "rope_parameters", {}) or {}
+            full = rope_params.get("full_attention", {}) or {}
+            try:
+                stored = object.__getattribute__(self, "__dict__").get("rope_scaling")
+            except Exception:
+                stored = None
+            out = dict(stored) if isinstance(stored, dict) else {}
+            out.setdefault("rope_type", full.get("rope_type", "default"))
+            if "rope_theta" in full and "rope_theta" not in out:
+                out["rope_theta"] = full["rope_theta"]
+            rope_type = str(out.get("rope_type", "default"))
+            if rope_type in {"linear", "dynamic", "yarn", "llama3", "longrope"} and "factor" not in out:
+                out["factor"] = float(full.get("factor", 1.0))
+            return out
+
+        Gemma3TextConfig.rope_local_base_freq = property(_rope_local_base_freq)
+        Gemma3TextConfig.rope_scaling = property(_rope_scaling)
+        logger.info("[DramaBox] DramaBox_Wrapper compat: patched Gemma3TextConfig rope fields")
+    except Exception as exc:
+        logger.debug("[DramaBox] DramaBox_Wrapper Gemma config patch skipped: %s", exc)
+
+    try:
+        from transformers import modeling_rope_utils as _rope_utils
+
+        if not getattr(_rope_utils, "_dramabox_wrapper_compat", False):
+            _orig_linear_scaling = _rope_utils._compute_linear_scaling_rope_parameters
+
+            def _linear_scaling_with_factor_fallback(config, device=None, seq_len=None, **rope_kwargs):
+                try:
+                    return _orig_linear_scaling(config, device=device, seq_len=seq_len, **rope_kwargs)
+                except KeyError as rope_exc:
+                    if str(rope_exc).strip("'\"") != "factor":
+                        raise
+
+                    scaling = getattr(config, "rope_scaling", None)
+                    if not isinstance(scaling, dict):
+                        raise
+
+                    scaling = dict(scaling)
+                    scaling.setdefault("factor", 1.0)
+                    try:
+                        setattr(config, "rope_scaling", scaling)
+                    except Exception:
+                        raise
+
+                    logger.warning(
+                        "[DramaBox] DramaBox_Wrapper compat: transformers linear rope missing factor; defaulted to 1.0"
+                    )
+                    return _orig_linear_scaling(config, device=device, seq_len=seq_len, **rope_kwargs)
+
+            _rope_utils._compute_linear_scaling_rope_parameters = _linear_scaling_with_factor_fallback
+            _rope_utils._dramabox_wrapper_compat = True
+            logger.info("[DramaBox] DramaBox_Wrapper compat: patched transformers linear rope factor fallback")
+    except Exception as exc:
+        logger.debug("[DramaBox] DramaBox_Wrapper rope utils patch skipped: %s", exc)
+
+    try:
+        from ltx_core.text_encoders.gemma.encoders import encoder_configurator as _enc_cfg
+
+        if not getattr(_enc_cfg, "_dramabox_wrapper_compat", False):
+            def _create_and_populate_compat(module):
+                model = module.model
+                vision_tower = model.model.vision_tower
+                v_model = getattr(vision_tower, "vision_model", vision_tower)
+                l_model = model.model.language_model
+
+                config = model.config.text_config
+                dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+
+                rope_params = getattr(config, "rope_parameters", {}) or {}
+                sliding = rope_params.get("sliding_attention", {}) or {}
+                full = rope_params.get("full_attention", {}) or {}
+                default_theta = getattr(config, "default_theta", {"local": 10000.0})
+                base = getattr(config, "rope_local_base_freq", None)
+                if base is None:
+                    base = sliding.get("rope_theta", default_theta.get("local", 10000.0))
+
+                local_rope_freqs = 1.0 / (
+                    float(base) ** (torch.arange(0, dim, 2, dtype=torch.int64).to(dtype=torch.float) / dim)
+                )
+
+                rope_scaling = getattr(config, "rope_scaling", None)
+                rope_type = rope_scaling.get("rope_type") if isinstance(rope_scaling, dict) else None
+                if rope_type is None:
+                    rope_type = full.get("rope_type", "default")
+
+                try:
+                    merged_rope_scaling = dict(rope_scaling) if isinstance(rope_scaling, dict) else {}
+                    merged_rope_scaling.setdefault("rope_type", rope_type)
+                    if "rope_theta" in full and "rope_theta" not in merged_rope_scaling:
+                        merged_rope_scaling["rope_theta"] = full["rope_theta"]
+                    if rope_type in {"linear", "dynamic", "yarn", "llama3", "longrope"} and "factor" not in merged_rope_scaling:
+                        merged_rope_scaling["factor"] = float(full.get("factor", 1.0))
+                    setattr(config, "rope_scaling", merged_rope_scaling)
+                except Exception:
+                    pass
+
+                if rope_type not in _enc_cfg.ROPE_INIT_FUNCTIONS:
+                    rope_type = "default"
+                    try:
+                        merged_rope_scaling = dict(getattr(config, "rope_scaling", {}) or {})
+                        merged_rope_scaling["rope_type"] = rope_type
+                        setattr(config, "rope_scaling", merged_rope_scaling)
+                    except Exception:
+                        pass
+
+                try:
+                    inv_freqs, _ = _enc_cfg.ROPE_INIT_FUNCTIONS[rope_type](config)
+                except KeyError as rope_exc:
+                    if str(rope_exc).strip("'\"") != "factor":
+                        raise
+                    merged_rope_scaling = dict(getattr(config, "rope_scaling", {}) or {})
+                    merged_rope_scaling.setdefault("factor", 1.0)
+                    try:
+                        setattr(config, "rope_scaling", merged_rope_scaling)
+                    except Exception:
+                        pass
+                    inv_freqs, _ = _enc_cfg.ROPE_INIT_FUNCTIONS[rope_type](config)
+                    logger.warning(
+                        "[DramaBox] DramaBox_Wrapper compat: missing rope_scaling.factor for %s; defaulted to 1.0",
+                        rope_type,
+                    )
+
+                positions_length = len(v_model.embeddings.position_ids[0])
+                position_ids = torch.arange(positions_length, dtype=torch.long, device="cpu").unsqueeze(0)
+                v_model.embeddings.register_buffer("position_ids", position_ids)
+                embed_scale = torch.tensor(model.config.text_config.hidden_size**0.5, device="cpu")
+                l_model.embed_tokens.register_buffer("embed_scale", embed_scale)
+                l_model.rotary_emb_local.register_buffer("inv_freq", local_rope_freqs)
+                l_model.rotary_emb.register_buffer("inv_freq", inv_freqs)
+
+                return module
+
+            _enc_cfg.create_and_populate = _create_and_populate_compat
+            if hasattr(_enc_cfg, "GEMMA_MODEL_OPS") and hasattr(_enc_cfg.GEMMA_MODEL_OPS, "mutator"):
+                _enc_cfg.GEMMA_MODEL_OPS.mutator = _create_and_populate_compat
+            _enc_cfg._dramabox_wrapper_compat = True
+            logger.info("[DramaBox] DramaBox_Wrapper compat: patched encoder_configurator.create_and_populate")
+    except Exception as exc:
+        logger.debug("[DramaBox] DramaBox_Wrapper encoder configurator patch skipped: %s", exc)
+
+    _DRAMABOX_WRAPPER_COMPAT_APPLIED = True
+
+
+def _get_og_server(device):
+    """Return a cached DramaBox_Wrapper TTSServer bound to the current torch device."""
+    cache_key = str(device)
+    if cache_key in _OG_SERVER_CACHE:
+        return _OG_SERVER_CACHE[cache_key]
+
+    _apply_dramabox_wrapper_compat()
+
+    from inference_server import TTSServer
+    from model_downloader import get_gemma_path, get_model_path
+
+    models_dir = _get_models_dir()
+    ckpt_transformer = get_model_path("transformer", cache_dir=models_dir)
+    ckpt_audio = get_model_path("audio_components", cache_dir=models_dir)
+    gemma_root = get_gemma_path(cache_dir=models_dir)
+
+    use_bnb_4bit = str(device).startswith("cuda")
+    server_kwargs = dict(
+        checkpoint=ckpt_transformer,
+        full_checkpoint=ckpt_audio,
+        gemma_root=gemma_root,
+        device=cache_key,
+        dtype="bf16",
+        compile_model=False,
+    )
+
+    def _new_server(bnb_flag: bool):
+        return TTSServer(bnb_4bit=bnb_flag, **server_kwargs)
+
+    try:
+        server = _new_server(use_bnb_4bit)
+    except Exception as exc:
+        msg = str(exc)
+        needs_compat_retry = (
+            "vision_model" in msg
+            or "rope_local_base_freq" in msg
+            or "rope_type" in msg
+            or "factor" in msg
+        )
+        if not needs_compat_retry:
+            raise
+
+        logger.warning(
+            "[DramaBox] DramaBox_Wrapper init mismatch (%s). Re-applying compat shims and retrying.",
+            exc,
+        )
+        _apply_dramabox_wrapper_compat(force=True)
+
+        try:
+            server = _new_server(use_bnb_4bit)
+        except Exception as exc2:
+            if not use_bnb_4bit:
+                raise
+            logger.warning(
+                "[DramaBox] DramaBox_Wrapper retry failed (%s). Retrying with bnb_4bit disabled.",
+                exc2,
+            )
+            server = _new_server(False)
+    _OG_SERVER_CACHE[cache_key] = server
+    logger.info("[DramaBox] DramaBox_Wrapper server ready on %s", cache_key)
+    return server
+
+
+def _release_og_server(device):
+    """Release cached DramaBox_Wrapper server for a device."""
+    import gc
+
+    cache_key = str(device)
+    if cache_key in _OG_SERVER_CACHE:
+        del _OG_SERVER_CACHE[cache_key]
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def _voice_ref_to_temp_wav(voice_ref):
+    """Write ComfyUI AUDIO input to a temporary wav file and return its path."""
+    if voice_ref is None:
+        return None
+
+    waveform = voice_ref.get("waveform") if isinstance(voice_ref, dict) else None
+    sample_rate = voice_ref.get("sample_rate") if isinstance(voice_ref, dict) else None
+    if waveform is None or sample_rate is None:
+        return None
+
+    import tempfile
+    import soundfile as sf
+
+    wav = waveform[0].detach().cpu().float().numpy()  # [C, S]
+    if wav.ndim == 2:
+        wav = wav.T
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        sf.write(tmp.name, wav, int(sample_rate))
+        return tmp.name
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Node
 # ─────────────────────────────────────────────────────────────────────────────
@@ -883,20 +1159,8 @@ class DramaBoxTTS:
                 pass
 
         opts = options or {}
+        generation_mode = _normalize_generation_mode(opts.get("generation_mode", "clip_loader"))
         attention_policy = str(opts.get("attention_policy", "best_available"))
-
-        # ── Load (or retrieve cached) model components ───────────────────
-        # _load_models() builds ModelPatchers on first call; subsequent calls
-        # return the cache. load_models_gpu() is called per-stage so only one
-        # large model occupies VRAM at a time; ComfyUI evicts the previous
-        # stage's weights to CPU automatically.
-        model = _load_models(device, attention_policy=attention_policy)
-        logger.info(
-            "[DramaBox] Attention backend in use (this run): %s (%s) [policy=%s]",
-            model.get("attention_backend_source", "unknown"),
-            model.get("attention_backend", "unknown"),
-            model.get("attention_policy", attention_policy),
-        )
         ref_duration: float  = opts.get("ref_duration", 10.0)
         gen_duration: float  = opts.get("gen_duration", 0.0)
         duration_mult: float = opts.get("duration_multiplier", 1.1)
@@ -913,6 +1177,57 @@ class DramaBoxTTS:
         offload_policy = str(opts.get("post_generate_model_policy", default_policy))
         if offload_policy not in {"keep_loaded", "offload_to_cpu", "offload"}:
             offload_policy = default_policy
+
+        if generation_mode == "dramabox_wrapper":
+            logger.info("[DramaBox] generation_mode=dramabox_wrapper")
+            if lora_stack:
+                logger.warning("[DramaBox] LoRA stack is not applied in dramabox_wrapper mode.")
+
+            server = _get_og_server(device)
+            tmp_voice_path = _voice_ref_to_temp_wav(voice_ref)
+            try:
+                waveform, sample_rate = server.generate(
+                    prompt=used_prompt,
+                    voice_ref=tmp_voice_path,
+                    cfg_scale=cfg_scale,
+                    stg_scale=stg_scale,
+                    duration_multiplier=duration_mult,
+                    seed=int(seed),
+                    ref_duration=float(ref_duration),
+                    rescale_scale=rescale_raw,
+                    gen_duration=float(gen_duration),
+                )
+            finally:
+                if tmp_voice_path:
+                    try:
+                        os.unlink(tmp_voice_path)
+                    except OSError:
+                        pass
+
+            waveform = waveform.detach().cpu().float()
+            if waveform.dim() == 2:
+                waveform = waveform.unsqueeze(0)
+
+            if offload_policy in {"offload_to_cpu", "offload"}:
+                logger.info("[DramaBox] dramabox_wrapper + offload policy -> releasing wrapper server cache")
+                _release_og_server(device)
+
+            return ({"waveform": waveform, "sample_rate": int(sample_rate)},)
+
+        logger.info("[DramaBox] generation_mode=clip_loader")
+
+        # ── Load (or retrieve cached) model components ───────────────────
+        # _load_models() builds ModelPatchers on first call; subsequent calls
+        # return the cache. load_models_gpu() is called per-stage so only one
+        # large model occupies VRAM at a time; ComfyUI evicts the previous
+        # stage's weights to CPU automatically.
+        model = _load_models(device, attention_policy=attention_policy)
+        logger.info(
+            "[DramaBox] Attention backend in use (this run): %s (%s) [policy=%s]",
+            model.get("attention_backend_source", "unknown"),
+            model.get("attention_backend", "unknown"),
+            model.get("attention_policy", attention_policy),
+        )
 
         # ── Resolve text encoder (external CLIP or auto-loaded CLIP) ───────────
         # Both paths produce a standard comfy.sd.CLIP — same encoding code runs
@@ -945,7 +1260,15 @@ class DramaBoxTTS:
         if gen_duration and gen_duration > 0:
             gen_dur = float(gen_duration)
         else:
-            gen_dur = round(estimate_speech_duration(used_prompt, speed) * duration_mult, 1)
+            est_base = estimate_speech_duration(used_prompt, speed)
+            gen_dur = max(3.0, round(est_base * duration_mult, 1))
+            logger.info(
+                "[DramaBox] Auto duration: base=%.1fs, multiplier=%.2f, speed=%.2f -> target=%.1fs",
+                est_base,
+                duration_mult,
+                speed,
+                gen_dur,
+            )
         fps = 25.0
         n_frames = int(round(gen_dur * fps)) + 1
         n_frames = ((n_frames - 1 + 4) // 8) * 8 + 1

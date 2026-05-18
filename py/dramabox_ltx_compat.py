@@ -68,12 +68,35 @@ class AudioDecoder:
             self._warm_decoder = self._ledger.audio_decoder()
             self._warm_vocoder = self._ledger.vocoder()
 
+    @staticmethod
+    def _prepare_decode_latent(latent: torch.Tensor) -> torch.Tensor:
+        """Return a decode-safe latent tensor.
+
+        Some vocoder kernels require tensors with version counters. Latents
+        produced under torch.inference_mode() do not track version counters,
+        so clone outside inference mode when needed.
+        """
+        try:
+            is_inference_tensor = bool(latent.is_inference())
+        except Exception:
+            is_inference_tensor = False
+
+        if not is_inference_tensor:
+            return latent
+
+        with torch.inference_mode(False):
+            return latent.detach().clone()
+
     def __call__(self, latent: torch.Tensor) -> Audio:
+        latent_for_decode = self._prepare_decode_latent(latent)
+
         if self._warm and self._warm_decoder is not None and self._warm_vocoder is not None:
-            return vae_decode_audio(latent, self._warm_decoder, self._warm_vocoder)
+            with torch.inference_mode(False), torch.no_grad():
+                return vae_decode_audio(latent_for_decode, self._warm_decoder, self._warm_vocoder)
 
         with gpu_model(self._ledger.audio_decoder()) as decoder, gpu_model(self._ledger.vocoder()) as vocoder:
-            return vae_decode_audio(latent, decoder, vocoder)
+            with torch.inference_mode(False), torch.no_grad():
+                return vae_decode_audio(latent_for_decode, decoder, vocoder)
 
 
 class AudioConditioner:

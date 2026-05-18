@@ -459,9 +459,9 @@ def main():
                 exc,
             )
     if selected_attention is None:
-            selected_attention = AttentionFunction(t_cfg.get("attention_type", "default"))
+        selected_attention = AttentionFunction(t_cfg.get("attention_type", "default"))
         attn_name = getattr(selected_attention, "value", str(selected_attention))
-            logging.info(f"Attention backend: checkpoint-config ({attn_name})")
+        logging.info(f"Attention backend: checkpoint-config ({attn_name})")
 
     class AudioOnlyConfigurator(ModelConfigurator[LTXModel]):
         @classmethod

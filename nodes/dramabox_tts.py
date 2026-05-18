@@ -75,8 +75,7 @@ def _get_models_dir() -> str:
     return models_dir
 
 _DEFAULT_NEG = (
-    "worst quality, inconsistent motion, blurry, jittery, distorted, "
-    "robotic voice, echo, background noise, off-sync audio, repetitive speech"
+    "worst quality, inconsistent, robotic, distorted, noise, static, muffled, unclear, unnatural, monotone"
 )
 
 
@@ -287,7 +286,7 @@ class _DramaBoxTextBundle(torch.nn.Module):
         self.embeddings_processor = embeddings_processor
 
 
-def _load_models(device) -> dict:
+def _load_models(device, attention_policy: str = "best_available") -> dict:
     """Load the audio VAE, transformer, and audio decoder with CPU-offload.
 
     All components are moved to GPU per-stage via mm.load_models_gpu().
@@ -299,7 +298,22 @@ def _load_models(device) -> dict:
     """
     import comfy.model_management as mm
 
-    cache_key = str(device)
+    valid_attention_policies = {
+        "best_available",
+        "checkpoint_config",
+        "force_fa2",
+        "force_sdpa",
+        "force_default",
+    }
+    attention_policy = str(attention_policy).strip().lower()
+    if attention_policy not in valid_attention_policies:
+        logger.warning(
+            "[DramaBox] Unknown attention policy '%s' - using best_available",
+            attention_policy,
+        )
+        attention_policy = "best_available"
+
+    cache_key = f"{device}|{attention_policy}"
     if cache_key in _LOADED_MODELS:
         logger.info("[DramaBox] Using cached models.")
         cached = _LOADED_MODELS[cache_key]
@@ -307,6 +321,8 @@ def _load_models(device) -> dict:
             cached["attention_backend"] = "unknown"
         if "attention_backend_source" not in cached:
             cached["attention_backend_source"] = "unknown"
+        if "attention_policy" not in cached:
+            cached["attention_policy"] = attention_policy
         return cached
 
     offload_device = mm.unet_offload_device()   # typically torch.device('cpu')
@@ -360,27 +376,69 @@ def _load_models(device) -> dict:
         config = json.loads(f.metadata()["config"])
 
     _t_cfg = config.get("transformer", {})
-    if callable(get_best_attention_function):
+    def _attention_from_name(name: str):
         try:
-            selected_attention = get_best_attention_function()
-            _attn_source = "best-available"
-            _attn_name = getattr(selected_attention, "value", str(selected_attention))
-            logger.info("[DramaBox] Attention backend: best-available (%s)", _attn_name)
-        except Exception as exc:
-            selected_attention = AttentionFunction(_t_cfg.get("attention_type", "default"))
-            _attn_source = "checkpoint-config"
-            _attn_name = getattr(selected_attention, "value", str(selected_attention))
-            logger.warning(
-                "[DramaBox] get_best_attention_function() failed (%s) - falling back to checkpoint attention_type='%s' (%s)",
-                exc,
-                _t_cfg.get("attention_type", "default"),
-                _attn_name,
-            )
-    else:
-        selected_attention = AttentionFunction(_t_cfg.get("attention_type", "default"))
+            return AttentionFunction(name)
+        except Exception:
+            try:
+                return AttentionFunction(str(name).lower())
+            except Exception:
+                return None
+
+    _ckpt_attn_name = str(_t_cfg.get("attention_type", "default"))
+    selected_attention = None
+    _attn_source = "checkpoint-config"
+
+    if attention_policy == "best_available":
+        if callable(get_best_attention_function):
+            try:
+                selected_attention = get_best_attention_function()
+                _attn_source = "best-available"
+            except Exception as exc:
+                logger.warning(
+                    "[DramaBox] get_best_attention_function() failed (%s) - falling back to checkpoint attention_type='%s'",
+                    exc,
+                    _ckpt_attn_name,
+                )
+
+    elif attention_policy == "checkpoint_config":
+        selected_attention = _attention_from_name(_ckpt_attn_name)
         _attn_source = "checkpoint-config"
-        _attn_name = getattr(selected_attention, "value", str(selected_attention))
-        logger.info("[DramaBox] Attention backend: checkpoint-config (%s)", _attn_name)
+
+    elif attention_policy in {"force_fa2", "force_sdpa", "force_default"}:
+        force_candidates = {
+            "force_fa2": ["flash_attention_2", "flash_attention2", "fa2", "flash_attn_2", "flash_attn2"],
+            "force_sdpa": ["sdpa"],
+            "force_default": ["default", "eager"],
+        }
+        for candidate in force_candidates[attention_policy]:
+            selected_attention = _attention_from_name(candidate)
+            if selected_attention is not None:
+                _attn_source = attention_policy
+                break
+        if selected_attention is None:
+            logger.warning(
+                "[DramaBox] Forced attention policy '%s' unavailable - falling back to checkpoint attention_type='%s'",
+                attention_policy,
+                _ckpt_attn_name,
+            )
+
+    if selected_attention is None:
+        selected_attention = _attention_from_name(_ckpt_attn_name)
+        _attn_source = "checkpoint-config"
+
+    if selected_attention is None:
+        selected_attention = AttentionFunction("default")
+        _attn_source = "default-fallback"
+        logger.warning("[DramaBox] Could not resolve checkpoint attention_type='%s' - using default", _ckpt_attn_name)
+
+    _attn_name = getattr(selected_attention, "value", str(selected_attention))
+    logger.info(
+        "[DramaBox] Attention backend: %s (%s) [policy=%s]",
+        _attn_source,
+        _attn_name,
+        attention_policy,
+    )
 
     class _AudioOnlyConfigurator(ModelConfigurator[LTXModel]):
         @classmethod
@@ -486,6 +544,7 @@ def _load_models(device) -> dict:
         "dtype":             torch_dtype,
         "attention_backend": _attn_name,
         "attention_backend_source": _attn_source,
+        "attention_policy": attention_policy,
     }
     _LOADED_MODELS[cache_key] = model
     logger.info("[DramaBox] Non-text components loaded (audio VAE, transformer, decoder).")
@@ -823,19 +882,21 @@ class DramaBoxTTS:
             except Exception:
                 pass
 
+        opts = options or {}
+        attention_policy = str(opts.get("attention_policy", "best_available"))
+
         # ── Load (or retrieve cached) model components ───────────────────
         # _load_models() builds ModelPatchers on first call; subsequent calls
         # return the cache. load_models_gpu() is called per-stage so only one
         # large model occupies VRAM at a time; ComfyUI evicts the previous
         # stage's weights to CPU automatically.
-        model = _load_models(device)
+        model = _load_models(device, attention_policy=attention_policy)
         logger.info(
-            "[DramaBox] Attention backend in use (this run): %s (%s)",
+            "[DramaBox] Attention backend in use (this run): %s (%s) [policy=%s]",
             model.get("attention_backend_source", "unknown"),
             model.get("attention_backend", "unknown"),
+            model.get("attention_policy", attention_policy),
         )
-
-        opts = options or {}
         ref_duration: float  = opts.get("ref_duration", 10.0)
         gen_duration: float  = opts.get("gen_duration", 0.0)
         duration_mult: float = opts.get("duration_multiplier", 1.1)
@@ -965,9 +1026,9 @@ class DramaBoxTTS:
             a_ctx_neg  = cond_neg["cond"].to(device=device, dtype=torch_dtype)
             del cond_neg, tokens_neg
 
-        # Keep context embeddings untouched (no trim/pad) and use separate
-        # guidance passes to avoid shape coupling/packing optimizations.
-        separate_guidance_passes = a_ctx_neg is not None
+        # Keep context embeddings untouched (no trim/pad).
+        # Let GuidedDenoiser auto-batch when contexts are compatible and
+        # fall back to separate passes only when needed.
         if a_ctx_neg is not None and a_ctx.dim() == 3 and a_ctx_neg.dim() == 3:
             if a_ctx.shape[1] != a_ctx_neg.shape[1]:
                 pos_len = a_ctx.shape[1]
@@ -1000,7 +1061,7 @@ class DramaBoxTTS:
             a_context=a_ctx,
             video_guider=None,
             audio_guider=guider,
-            separate_passes=separate_guidance_passes,
+            separate_passes=False,
         )
 
         # ── 7. Diffusion sampling ────────────────────────────────────────

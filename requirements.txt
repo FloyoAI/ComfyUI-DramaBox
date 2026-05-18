@@ -1,3 +1,5 @@
 # ComfyUI-DramaBox extra dependencies
 
+ltx-core
+ltx-pipelines
 soundfile>=0.12.0

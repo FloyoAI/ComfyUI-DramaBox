@@ -36,11 +36,11 @@ import soundfile as sf
 import torch
 
 REPO_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ltx2"))
-# ltx-pipelines already on path via ltx2/
 
 # Also add the local directory so audio_conditioning.py is importable
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_src_dir = os.path.dirname(os.path.abspath(__file__))
+if _src_dir not in sys.path:
+    sys.path.append(_src_dir)
 
 MODEL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
 GEMMA_DIR = os.environ.get("GEMMA_DIR", "gemma-3-12b-it-qat-q4_0-unquantized")
@@ -290,7 +290,6 @@ def main():
     # ---- Imports (deferred to avoid startup cost when checking --help) ----
     from audio_conditioning import AudioConditionByReferenceLatent
 
-    from ltx_core.batch_split import BatchSplitAdapter
     from ltx_core.components.diffusion_steps import EulerDiffusionStep
     from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
     from ltx_core.components.noisers import GaussianNoiser
@@ -306,12 +305,11 @@ def main():
     from ltx_core.model.transformer.rope import LTXRopeType
     from ltx_core.tools import AudioLatentTools
     from ltx_core.types import Audio, AudioLatentShape, LatentState, VideoPixelShape
-    from ltx_pipelines.utils.blocks import AudioConditioner, AudioDecoder, PromptEncoder
+    from dramabox_ltx_compat import AudioConditioner, AudioDecoder, PromptEncoder
+    from dramabox_ltx_compat import GuidedDenoiser, SimpleDenoiser
+    from dramabox_ltx_compat import gpu_model, euler_denoising_loop, heun_denoising_loop
     from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES
-    from ltx_pipelines.utils.denoisers import GuidedDenoiser, SimpleDenoiser
-    from ltx_pipelines.utils.gpu_model import gpu_model
     from ltx_pipelines.utils.media_io import decode_audio_from_file
-    from ltx_pipelines.utils.samplers import euler_denoising_loop, heun_denoising_loop
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16
@@ -593,15 +591,13 @@ def main():
     # ---- Denoising loop ----
     logging.info(f"Running denoising loop ({len(sigmas) - 1} steps)...")
     with gpu_model(x0_model) as model:
-        batched_model = BatchSplitAdapter(model, max_batch_size=1)
-
         denoise_fn = heun_denoising_loop if args.sampler == "heun" else euler_denoising_loop
         _, audio_state = denoise_fn(
             sigmas=sigmas,
             video_state=None,
             audio_state=noised_state,
             stepper=stepper,
-            transformer=batched_model,
+            transformer=model,
             denoiser=denoiser,
         )
 

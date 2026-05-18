@@ -32,12 +32,13 @@ import types
 
 import torch
 
-# ── ensure src/ and ltx2/ are on sys.path ────────────────────────────────────
+# ── local import bootstrap ────────────────────────────────────────────────────
 _NODE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-for _sub in ("src", "ltx2"):
-    _p = os.path.join(_NODE_DIR, _sub)
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+
+# Always make local src importable for node-local helpers.
+_SRC_DIR = os.path.join(_NODE_DIR, "src")
+if _SRC_DIR not in sys.path:
+    sys.path.append(_SRC_DIR)
 
 import comfy.model_management
 import comfy.sd
@@ -629,7 +630,7 @@ class DramaBoxTextEncoderLoader:
         # Last resort: model_downloader path (may trigger a download)
         try:
             from model_downloader import get_model_path
-            p = get_model_path("audio_components", cache_dir=os.path.join(_NODE_DIR, "models"))
+            p = get_model_path("audio_components")
             if os.path.isfile(p):
                 return p
         except Exception:

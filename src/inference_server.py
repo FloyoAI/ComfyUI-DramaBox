@@ -20,8 +20,10 @@ import soundfile as sf
 
 # Setup paths
 APP_DIR = Path(__file__).parent.parent
-sys.path.insert(0, str(APP_DIR / "ltx2"))
-sys.path.insert(0, str(APP_DIR / "src"))
+
+_src_dir = str(APP_DIR / "src")
+if _src_dir not in sys.path:
+    sys.path.append(_src_dir)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -42,10 +44,9 @@ from ltx_core.model.model_protocol import ModelConfigurator
 from ltx_core.tools import AudioLatentTools
 from ltx_core.types import Audio, AudioLatentShape, VideoPixelShape
 from ltx_core.model.audio_vae import encode_audio as vae_encode_audio
-from ltx_pipelines.utils.blocks import AudioConditioner, AudioDecoder, PromptEncoder
+from dramabox_ltx_compat import AudioConditioner, AudioDecoder, PromptEncoder
+from dramabox_ltx_compat import GuidedDenoiser, euler_denoising_loop
 from ltx_pipelines.utils.media_io import decode_audio_from_file
-from ltx_pipelines.utils.denoisers import GuidedDenoiser
-from ltx_pipelines.utils.samplers import euler_denoising_loop
 from safetensors import safe_open
 
 

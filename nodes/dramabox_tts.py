@@ -48,23 +48,31 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 
-# ── ensure bundled src/ and ltx2/ are importable ─────────────────────────────
+# ── local import bootstrap ────────────────────────────────────────────────────
 _NODE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-for _sub in ("src", "ltx2"):
-    _p = os.path.join(_NODE_DIR, _sub)
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+
+# Always make local src importable for node-local helpers.
+_SRC_DIR = os.path.join(_NODE_DIR, "src")
+if _SRC_DIR not in sys.path:
+    sys.path.append(_SRC_DIR)
 
 from .dramabox_clip import DramaBoxTextEncoderLoader  # noqa: E402
 
-# Use ComfyUI's central models folder so weights are shared with other nodes.
-# Fall back to the node-local models/ dir when running outside ComfyUI.
-try:
-    import folder_paths as _folder_paths
-    _MODELS_DIR = _folder_paths.models_dir
-except Exception:
-    _MODELS_DIR = os.path.join(_NODE_DIR, "models")
-os.makedirs(os.path.join(_MODELS_DIR, "dramabox"), exist_ok=True)
+
+def _get_models_dir() -> str:
+    """Resolve ComfyUI models root at runtime.
+
+    This avoids locking in a node-local fallback when folder_paths is not yet
+    importable during early module import.
+    """
+    try:
+        import folder_paths as _folder_paths
+        models_dir = _folder_paths.models_dir
+    except Exception:
+        models_dir = os.path.join(_NODE_DIR, "models")
+
+    os.makedirs(os.path.join(models_dir, "dramabox"), exist_ok=True)
+    return models_dir
 
 _DEFAULT_NEG = (
     "worst quality, inconsistent motion, blurry, jittery, distorted, "
@@ -152,7 +160,7 @@ def _find_or_download_gemma_path():
         import folder_paths as _fp
         te_dirs = _fp.get_folder_paths("text_encoders")
     except Exception:
-        te_dirs = [os.path.join(_MODELS_DIR, "text_encoders")]
+        te_dirs = [os.path.join(_get_models_dir(), "text_encoders")]
 
     gguf_dirs = []
     if _fp is not None:
@@ -301,11 +309,12 @@ def _load_models(device) -> dict:
 
     # -- Resolve weight paths (local-first via patched model_downloader) -------
     from model_downloader import get_model_path
+    models_dir = _get_models_dir()
     logger.info("[DramaBox] Resolving model weights…")
-    ckpt_transformer = get_model_path("transformer",      cache_dir=_MODELS_DIR)
-    ckpt_audio       = get_model_path("audio_components", cache_dir=_MODELS_DIR)
+    ckpt_transformer = get_model_path("transformer",      cache_dir=models_dir)
+    ckpt_audio       = get_model_path("audio_components", cache_dir=models_dir)
 
-    from ltx_pipelines.utils.blocks import AudioConditioner, AudioDecoder
+    from dramabox_ltx_compat import AudioConditioner, AudioDecoder
 
     # ── 1. AudioConditioner (VAE encoder) — load to CPU ──────────────────────
     logger.info("[DramaBox] Loading AudioConditioner (CPU)…")
@@ -816,7 +825,7 @@ class DramaBoxTTS:
         decoder     = model["audio_decoder"]
         torch_dtype = model["dtype"]
 
-        # ── imports from bundled ltx2 / src ─────────────────────────────
+        # ── imports from ltx packages + local compatibility shims ───────────
         from ltx_core.components.noisers import GaussianNoiser
         from ltx_core.components.patchifiers import AudioPatchifier
         from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
@@ -826,8 +835,7 @@ class DramaBoxTTS:
         from ltx_core.model.audio_vae import encode_audio as vae_encode_audio
         from ltx_core.tools import AudioLatentTools
         from ltx_core.types import Audio, AudioLatentShape, VideoPixelShape
-        from ltx_pipelines.utils.denoisers import GuidedDenoiser
-        from ltx_pipelines.utils.samplers import euler_denoising_loop
+        from dramabox_ltx_compat import GuidedDenoiser, euler_denoising_loop
         from audio_conditioning import AudioConditionByReferenceLatent
         from inference import estimate_speech_duration
 

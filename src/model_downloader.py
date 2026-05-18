@@ -35,12 +35,53 @@ _SRC_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 # Old node-local models directory — used as migration source
 _NODE_MODELS_DIR = _SRC_DIR.parent / "models"
 
-# Prefer ComfyUI's central models folder; fall back to the node-local directory
-try:
-    import folder_paths as _fp
-    DEFAULT_MODELS_DIR = str(Path(_fp.models_dir))
-except Exception:
-    DEFAULT_MODELS_DIR = str(_NODE_MODELS_DIR)
+
+def _comfy_models_dir() -> Path | None:
+    """Return ComfyUI's models root when available in this process."""
+    try:
+        import folder_paths as _fp
+        return Path(_fp.models_dir)
+    except Exception:
+        return None
+
+
+def _same_path(a: Path, b: Path) -> bool:
+    try:
+        return a.resolve() == b.resolve()
+    except Exception:
+        return str(a) == str(b)
+
+
+def _resolve_models_dir(cache_dir=None) -> Path:
+    """Resolve the target models root robustly at call-time.
+
+    If the caller passed the node-local fallback path but ComfyUI's shared
+    models directory is available now, promote to the shared directory.
+    """
+    comfy_dir = _comfy_models_dir()
+
+    if cache_dir is not None:
+        requested = Path(cache_dir)
+        if comfy_dir is not None and _same_path(requested, _NODE_MODELS_DIR):
+            return comfy_dir
+        return requested
+
+    return comfy_dir if comfy_dir is not None else _NODE_MODELS_DIR
+
+
+def _lookup_models_dirs(primary: Path) -> list[Path]:
+    """Directories to search before downloading, in priority order."""
+    candidates = [primary]
+    comfy_dir = _comfy_models_dir()
+    if comfy_dir is not None:
+        candidates.append(comfy_dir)
+    candidates.append(_NODE_MODELS_DIR)
+
+    out: list[Path] = []
+    for p in candidates:
+        if not any(_same_path(p, q) for q in out):
+            out.append(p)
+    return out
 
 # HF repo path → local filename (always stored flat inside dramabox/)
 MODEL_FILES = {
@@ -205,25 +246,30 @@ def get_model_path(name, cache_dir=None):
 
     Args:
         name: One of 'transformer', 'audio_components', 'silence_latent'
-        cache_dir: Root models directory (default: <node_root>/models/)
+        cache_dir: Root models directory (default: ComfyUI models dir when available)
 
     Returns:
         Absolute local file path as a string
     """
-    models_dir = Path(cache_dir or DEFAULT_MODELS_DIR)
+    models_dir = _resolve_models_dir(cache_dir)
     migrate_old_layout(models_dir)
-    dramabox_dir = models_dir / "dramabox"
 
     if name not in MODEL_FILES:
         raise ValueError(f"Unknown model: {name}. Choose from: {list(MODEL_FILES.keys())}")
 
     repo_filename = MODEL_FILES[name]
-    # Always store flat — strip any sub-directory from the repo path
-    local_path = dramabox_dir / Path(repo_filename).name
+    local_name = Path(repo_filename).name
 
-    if local_path.is_file():
-        logger.info(f"[DramaBox] Found {name} locally: {local_path}")
-        return str(local_path)
+    # First, look for an existing file in known models roots to avoid duplicate downloads.
+    for root in _lookup_models_dirs(models_dir):
+        migrate_old_layout(root)
+        candidate = root / "dramabox" / local_name
+        if candidate.is_file():
+            logger.info(f"[DramaBox] Found {name} locally: {candidate}")
+            return str(candidate)
+
+    dramabox_dir = models_dir / "dramabox"
+    local_path = dramabox_dir / local_name
 
     dramabox_dir.mkdir(parents=True, exist_ok=True)
     print(f"[DramaBox] Downloading {name} ({Path(repo_filename).name}) from HuggingFace...")
@@ -235,7 +281,6 @@ def get_model_path(name, cache_dir=None):
             repo_id=DRAMABOX_REPO,
             allow_patterns=[repo_filename],
             local_dir=str(dramabox_dir),
-            local_dir_use_symlinks=False,
             token=os.environ.get("HF_TOKEN"),
         )
     finally:
@@ -259,12 +304,12 @@ def get_gemma_path(cache_dir=None):
     quantization and ~halves the Gemma load time.
 
     Args:
-        cache_dir: Root models directory (default: <node_root>/models/)
+        cache_dir: Root models directory (default: ComfyUI models dir when available)
 
     Returns:
         Absolute local directory path as a string
     """
-    models_dir = Path(cache_dir or DEFAULT_MODELS_DIR)
+    models_dir = _resolve_models_dir(cache_dir)
     migrate_old_layout(models_dir)
     gemma_name = GEMMA_REPO.split("/")[-1]   # "gemma-3-12b-it-bnb-4bit"
     local_dir = models_dir / "dramabox" / gemma_name
@@ -284,7 +329,6 @@ def get_gemma_path(cache_dir=None):
         snapshot_download(
             repo_id=GEMMA_REPO,
             local_dir=str(local_dir),
-            local_dir_use_symlinks=False,
             token=os.environ.get("HF_TOKEN"),
         )
     finally:

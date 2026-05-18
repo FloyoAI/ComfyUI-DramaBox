@@ -92,6 +92,7 @@ Voice LoRAs for DramaBox can be trained with **[Voice Clone Studio — DramaBox 
 - **Default encoder** — switched to `gemma_3_12B_it_fp4_mixed.safetensors` (ComfyUI/Comfy-Org's own quantized file, ~8 GB vs ~24 GB for the previous bnb-4bit snapshot). Downloaded automatically into `text_encoders/` on first use if not already present.
 - **DramaBox CLIP Loader node** — optional node to load Gemma text encoders from `text_encoders/` (safetensors) and GGUF files when ComfyUI-GGUF is installed. Connect to the TTS node's `dramabox_clip` input for per-workflow encoder selection.
 - **Settings preference** — added *ComfyUI Settings → DramaBox → Default Text Encoder filename* to set a global default without needing a CLIP Loader node in every workflow.
+- **LTX package compatibility** — DramaBox now relies on installed `ltx-core` / `ltx-pipelines` packages and ships only DramaBox-specific compatibility code in `src/`, reducing conflicts with other LTX-based custom nodes.
 - **Old Gemma snapshot cleanup** — the large `gemma-3-12b-it-bnb-4bit/` model directory (previously downloaded into `models/dramabox/`) is automatically removed on startup since it is no longer needed.
 - **Removed info output** — the `info` string output has been removed from the DramaBox TTS node.
 

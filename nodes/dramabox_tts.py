@@ -302,7 +302,12 @@ def _load_models(device) -> dict:
     cache_key = str(device)
     if cache_key in _LOADED_MODELS:
         logger.info("[DramaBox] Using cached models.")
-        return _LOADED_MODELS[cache_key]
+        cached = _LOADED_MODELS[cache_key]
+        if "attention_backend" not in cached:
+            cached["attention_backend"] = "unknown"
+        if "attention_backend_source" not in cached:
+            cached["attention_backend_source"] = "unknown"
+        return cached
 
     offload_device = mm.unet_offload_device()   # typically torch.device('cpu')
     torch_dtype = torch.bfloat16
@@ -344,11 +349,38 @@ def _load_models(device) -> dict:
     from ltx_core.model.transformer.model import LTXModel, LTXModelType
     from ltx_core.model.transformer.rope import LTXRopeType
     from ltx_core.model.transformer.text_projection import create_caption_projection
-    from ltx_core.model.transformer.attention import AttentionFunction
+    try:
+        from ltx_core.model.transformer.attention import AttentionFunction, get_best_attention_function
+    except Exception:
+        from ltx_core.model.transformer.attention import AttentionFunction
+        get_best_attention_function = None
     from ltx_core.model.model_protocol import ModelConfigurator
 
     with safe_open(ckpt_transformer, framework="pt") as f:
         config = json.loads(f.metadata()["config"])
+
+    _t_cfg = config.get("transformer", {})
+    if callable(get_best_attention_function):
+        try:
+            selected_attention = get_best_attention_function()
+            _attn_source = "best-available"
+            _attn_name = getattr(selected_attention, "value", str(selected_attention))
+            logger.info("[DramaBox] Attention backend: best-available (%s)", _attn_name)
+        except Exception as exc:
+            selected_attention = AttentionFunction(_t_cfg.get("attention_type", "default"))
+            _attn_source = "checkpoint-config"
+            _attn_name = getattr(selected_attention, "value", str(selected_attention))
+            logger.warning(
+                "[DramaBox] get_best_attention_function() failed (%s) - falling back to checkpoint attention_type='%s' (%s)",
+                exc,
+                _t_cfg.get("attention_type", "default"),
+                _attn_name,
+            )
+    else:
+        selected_attention = AttentionFunction(_t_cfg.get("attention_type", "default"))
+        _attn_source = "checkpoint-config"
+        _attn_name = getattr(selected_attention, "value", str(selected_attention))
+        logger.info("[DramaBox] Attention backend: checkpoint-config (%s)", _attn_name)
 
     class _AudioOnlyConfigurator(ModelConfigurator[LTXModel]):
         @classmethod
@@ -367,7 +399,7 @@ def _load_models(device) -> dict:
                 num_layers=_t.get("num_layers", 48),
                 audio_cross_attention_dim=_t.get("audio_cross_attention_dim", 2048),
                 norm_eps=_t.get("norm_eps", 1e-6),
-                attention_type=AttentionFunction(_t.get("attention_type", "default")),
+                attention_type=selected_attention,
                 positional_embedding_theta=10000.0,
                 audio_positional_embedding_max_pos=[20.0],
                 timestep_scale_multiplier=_t.get("timestep_scale_multiplier", 1000),
@@ -452,6 +484,8 @@ def _load_models(device) -> dict:
         "audio_decoder":     audio_decoder,
         "device":            device,
         "dtype":             torch_dtype,
+        "attention_backend": _attn_name,
+        "attention_backend_source": _attn_source,
     }
     _LOADED_MODELS[cache_key] = model
     logger.info("[DramaBox] Non-text components loaded (audio VAE, transformer, decoder).")
@@ -795,6 +829,11 @@ class DramaBoxTTS:
         # large model occupies VRAM at a time; ComfyUI evicts the previous
         # stage's weights to CPU automatically.
         model = _load_models(device)
+        logger.info(
+            "[DramaBox] Attention backend in use (this run): %s (%s)",
+            model.get("attention_backend_source", "unknown"),
+            model.get("attention_backend", "unknown"),
+        )
 
         opts = options or {}
         ref_duration: float  = opts.get("ref_duration", 10.0)
@@ -809,7 +848,6 @@ class DramaBoxTTS:
         rescale_scale: float = (
             _auto_rescale(cfg_scale) if rescale_raw == "auto" else float(rescale_raw)
         )
-
         default_policy = "offload_to_cpu" if _get_dramabox_bool_setting("DramaBox.autoOffload", True) else "keep_loaded"
         offload_policy = str(opts.get("post_generate_model_policy", default_policy))
         if offload_policy not in {"keep_loaded", "offload_to_cpu", "offload"}:
@@ -927,26 +965,18 @@ class DramaBoxTTS:
             a_ctx_neg  = cond_neg["cond"].to(device=device, dtype=torch_dtype)
             del cond_neg, tokens_neg
 
-        # Guided denoising concatenates positive/negative contexts along batch,
-        # so sequence length must match. Prompt trimming may produce different
-        # lengths (e.g. 256 vs 128), so pad the shorter one on the left.
+        # Keep context embeddings untouched (no trim/pad) and use separate
+        # guidance passes to avoid shape coupling/packing optimizations.
+        separate_guidance_passes = a_ctx_neg is not None
         if a_ctx_neg is not None and a_ctx.dim() == 3 and a_ctx_neg.dim() == 3:
             if a_ctx.shape[1] != a_ctx_neg.shape[1]:
-                target_len = max(a_ctx.shape[1], a_ctx_neg.shape[1])
-
-                def _left_pad_ctx(ctx: torch.Tensor, tgt: int) -> torch.Tensor:
-                    cur = ctx.shape[1]
-                    if cur >= tgt:
-                        return ctx[:, -tgt:, :]
-                    pad = ctx.new_zeros((ctx.shape[0], tgt - cur, ctx.shape[2]))
-                    return torch.cat((pad, ctx), dim=1)
-
+                pos_len = a_ctx.shape[1]
+                neg_len = a_ctx_neg.shape[1]
                 logger.info(
-                    "[DramaBox] Aligning context lengths for CFG: pos=%d neg=%d -> %d",
-                    a_ctx.shape[1], a_ctx_neg.shape[1], target_len,
+                    "[DramaBox] CFG context alignment (no_align): keeping pos=%d neg=%d unchanged",
+                    pos_len,
+                    neg_len,
                 )
-                a_ctx = _left_pad_ctx(a_ctx, target_len)
-                a_ctx_neg = _left_pad_ctx(a_ctx_neg, target_len)
 
         # Unified offload policy from Options (or preference-based default).
         if offload_policy in {"offload_to_cpu", "offload"}:
@@ -970,6 +1000,7 @@ class DramaBoxTTS:
             a_context=a_ctx,
             video_guider=None,
             audio_guider=guider,
+            separate_passes=separate_guidance_passes,
         )
 
         # ── 7. Diffusion sampling ────────────────────────────────────────

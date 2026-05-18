@@ -300,7 +300,11 @@ def main():
     from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
     from ltx_core.model.audio_vae import encode_audio as vae_encode_audio
     from ltx_core.model.model_protocol import ModelConfigurator
-    from ltx_core.model.transformer.attention import AttentionFunction
+    try:
+        from ltx_core.model.transformer.attention import AttentionFunction, get_best_attention_function
+    except Exception:
+        from ltx_core.model.transformer.attention import AttentionFunction
+        get_best_attention_function = None
     from ltx_core.model.transformer.model import LTXModel, LTXModelType, X0Model
     from ltx_core.model.transformer.rope import LTXRopeType
     from ltx_core.tools import AudioLatentTools
@@ -310,6 +314,7 @@ def main():
     from dramabox_ltx_compat import gpu_model, euler_denoising_loop, heun_denoising_loop
     from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES
     from ltx_pipelines.utils.media_io import decode_audio_from_file
+    from safetensors import safe_open
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16
@@ -438,6 +443,26 @@ def main():
         "model.diffusion_model.", ""
     )
 
+    with safe_open(args.checkpoint, framework="pt") as f:
+        ckpt_cfg = json.loads(f.metadata()["config"])
+    t_cfg = ckpt_cfg.get("transformer", {})
+
+    selected_attention = None
+    if callable(get_best_attention_function):
+        try:
+            selected_attention = get_best_attention_function()
+            attn_name = getattr(selected_attention, "value", str(selected_attention))
+            logging.info(f"Attention backend: best-available ({attn_name})")
+        except Exception as exc:
+            logging.warning(
+                "get_best_attention_function() failed (%s) - falling back to checkpoint-config attention_type",
+                exc,
+            )
+    if selected_attention is None:
+            selected_attention = AttentionFunction(t_cfg.get("attention_type", "default"))
+        attn_name = getattr(selected_attention, "value", str(selected_attention))
+            logging.info(f"Attention backend: checkpoint-config ({attn_name})")
+
     class AudioOnlyConfigurator(ModelConfigurator[LTXModel]):
         @classmethod
         def from_config(cls, config):
@@ -457,7 +482,7 @@ def main():
                 num_layers=t.get("num_layers", 48),
                 audio_cross_attention_dim=t.get("audio_cross_attention_dim", 2048),
                 norm_eps=t.get("norm_eps", 1e-6),
-                attention_type=AttentionFunction(t.get("attention_type", "default")),
+                attention_type=selected_attention,
                 positional_embedding_theta=10000.0,
                 audio_positional_embedding_max_pos=[20.0],
                 timestep_scale_multiplier=t.get("timestep_scale_multiplier", 1000),

@@ -240,6 +240,7 @@ def _guided_denoise(  # noqa: PLR0913
     last_denoised_video: torch.Tensor | None,
     last_denoised_audio: torch.Tensor | None,
     step_index: int,
+    separate_passes: bool = False,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     v_skip = video_guider.should_skip_step(step_index)
     a_skip = audio_guider.should_skip_step(step_index)
@@ -294,6 +295,62 @@ def _guided_denoise(  # noqa: PLR0913
     pass_names = [name for name, _, _, _ in passes]
     ptb_configs = [ptb for _, _, _, ptb in passes]
     n = len(passes)
+
+    def _contexts_batch_compatible() -> bool:
+        if video_state is not None:
+            v_contexts = [vc for _, vc, _, _ in passes]
+            if any(vc is None for vc in v_contexts):
+                return False
+            ref_shape = v_contexts[0].shape[1:]
+            if any(vc.shape[1:] != ref_shape for vc in v_contexts[1:]):
+                return False
+        if audio_state is not None:
+            a_contexts = [ac for _, _, ac, _ in passes]
+            if any(ac is None for ac in a_contexts):
+                return False
+            ref_shape = a_contexts[0].shape[1:]
+            if any(ac.shape[1:] != ref_shape for ac in a_contexts[1:]):
+                return False
+        return True
+
+    use_separate_passes = separate_passes or not _contexts_batch_compatible()
+
+    if use_separate_passes:
+        r: dict[str, tuple[torch.Tensor | float, torch.Tensor | float]] = {}
+        for pass_name, pass_v_context, pass_a_context, pass_ptb in passes:
+            pass_video = None
+            if video_state is not None:
+                pass_video = _modality_from_latent_state(
+                    video_state,
+                    pass_v_context,
+                    sigma,
+                    enabled=not v_skip,
+                )
+
+            pass_audio = None
+            if audio_state is not None:
+                pass_audio = _modality_from_latent_state(
+                    audio_state,
+                    pass_a_context,
+                    sigma,
+                    enabled=not a_skip,
+                )
+
+            out_v, out_a = transformer(
+                video=pass_video,
+                audio=pass_audio,
+                perturbations=BatchedPerturbationConfig([pass_ptb]),
+            )
+            r[pass_name] = (out_v if out_v is not None else 0.0, out_a if out_a is not None else 0.0)
+
+        cond_v, cond_a = r["cond"]
+        uncond_v, uncond_a = r.get("uncond", (0.0, 0.0))
+        ptb_v, ptb_a = r.get("ptb", (0.0, 0.0))
+        mod_v, mod_a = r.get("mod", (0.0, 0.0))
+
+        denoised_video = last_denoised_video if v_skip else video_guider.calculate(cond_v, uncond_v, ptb_v, mod_v)
+        denoised_audio = last_denoised_audio if a_skip else audio_guider.calculate(cond_a, uncond_a, ptb_a, mod_a)
+        return denoised_video, denoised_audio
 
     def _batched_sigma(state: LatentState) -> torch.Tensor:
         return sigma.expand(state.latent.shape[0] * n)
@@ -364,11 +421,13 @@ class GuidedDenoiser:
         a_context: torch.Tensor | None,
         video_guider: MultiModalGuider | None = None,
         audio_guider: MultiModalGuider | None = None,
+        separate_passes: bool = False,
     ) -> None:
         self.v_context = v_context
         self.a_context = a_context
         self.video_guider = video_guider
         self.audio_guider = audio_guider
+        self.separate_passes = separate_passes
         self._last_denoised_video: torch.Tensor | None = None
         self._last_denoised_audio: torch.Tensor | None = None
 
@@ -392,6 +451,7 @@ class GuidedDenoiser:
             last_denoised_video=self._last_denoised_video,
             last_denoised_audio=self._last_denoised_audio,
             step_index=step_index,
+            separate_passes=self.separate_passes,
         )
         self._last_denoised_video = denoised_video
         self._last_denoised_audio = denoised_audio

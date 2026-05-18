@@ -39,7 +39,11 @@ from ltx_core.loader.sd_ops import SDOps
 from ltx_core.model.transformer.model import LTXModel, LTXModelType, X0Model
 from ltx_core.model.transformer.rope import LTXRopeType
 from ltx_core.model.transformer.text_projection import create_caption_projection
-from ltx_core.model.transformer.attention import AttentionFunction
+try:
+    from ltx_core.model.transformer.attention import AttentionFunction, get_best_attention_function
+except Exception:
+    from ltx_core.model.transformer.attention import AttentionFunction
+    get_best_attention_function = None
 from ltx_core.model.model_protocol import ModelConfigurator
 from ltx_core.tools import AudioLatentTools
 from ltx_core.types import Audio, AudioLatentShape, VideoPixelShape
@@ -145,6 +149,24 @@ class TTSServer:
             config = json.loads(f.metadata()["config"])
 
         t = config.get("transformer", {})
+        if callable(get_best_attention_function):
+            try:
+                selected_attention = get_best_attention_function()
+                attn_name = getattr(selected_attention, "value", str(selected_attention))
+                logging.info(f"  Attention backend: best-available ({attn_name})")
+            except Exception as exc:
+                selected_attention = AttentionFunction(t.get("attention_type", "default"))
+                attn_name = getattr(selected_attention, "value", str(selected_attention))
+                logging.warning(
+                    "get_best_attention_function() failed (%s) - falling back to checkpoint attention_type='%s' (%s)",
+                    exc,
+                    t.get("attention_type", "default"),
+                    attn_name,
+                )
+        else:
+            selected_attention = AttentionFunction(t.get("attention_type", "default"))
+            attn_name = getattr(selected_attention, "value", str(selected_attention))
+            logging.info(f"  Attention backend: checkpoint-config ({attn_name})")
 
         class AudioOnlyConfigurator(ModelConfigurator[LTXModel]):
             @classmethod
@@ -163,7 +185,7 @@ class TTSServer:
                     num_layers=t.get("num_layers", 48),
                     audio_cross_attention_dim=t.get("audio_cross_attention_dim", 2048),
                     norm_eps=t.get("norm_eps", 1e-6),
-                    attention_type=AttentionFunction(t.get("attention_type", "default")),
+                    attention_type=selected_attention,
                     positional_embedding_theta=10000.0,
                     audio_positional_embedding_max_pos=[20.0],
                     timestep_scale_multiplier=t.get("timestep_scale_multiplier", 1000),

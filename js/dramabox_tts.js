@@ -169,15 +169,15 @@ app.registerExtension({
                 "to override per-workflow.",
         },
         {
-            id: "DramaBox.offloadTextEncoderAfterEncode",
-            name: "Offload text encoder after prompt encoding",
-            category: ["DramaBox", "Text Encoder", "Memory"],
+            id: "DramaBox.autoOffload",
+            name: "Automatic model offload (text encoder + post-generate)",
+            category: ["DramaBox", "Memory"],
             type: "boolean",
             defaultValue: true,
             tooltip:
-                "When enabled (recommended), DramaBox offloads Gemma to CPU right after " +
-                "prompt encoding. This lowers VRAM pressure for diffusion stages. Disable " +
-                "if you prefer maximum throughput on very high-VRAM GPUs.",
+                "When enabled (recommended), DramaBox offloads Gemma right after prompt " +
+                "encoding and offloads DramaBox models to CPU after generation. Disable " +
+                "if you have very high VRAM and prefer maximum throughput.",
         },
     ],
 });

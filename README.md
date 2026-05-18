@@ -18,7 +18,12 @@ DramaBox uses a Gemma 3 12B text encoder. By default the node loads **`gemma_3_1
 
 **Per-installation preference** — open *ComfyUI Settings → DramaBox → Default Text Encoder filename* and enter the filename of any Gemma safetensors already in your `text_encoders` folder (e.g. `gemma_3_12b_it_fp8_scaled.safetensors`). Leave it blank to keep the fp4 default.
 
-**Memory preference** — open *ComfyUI Settings → DramaBox → Text Encoder → Memory* and keep **Offload text encoder after prompt encoding** enabled (default) to move Gemma back to CPU immediately after text encoding. This lowers VRAM usage for the diffusion stages. If you have plenty of VRAM and prefer maximum throughput, you can disable it.
+**Memory preference** — open *ComfyUI Settings → DramaBox → Memory* and keep **Automatic model offload (text encoder + post-generate)** enabled (default). This does two things automatically:
+
+- Offloads Gemma right after prompt encoding.
+- Offloads DramaBox models to CPU after generation.
+
+If you have plenty of VRAM and prefer maximum throughput, you can disable this preference to keep models resident on GPU.
 
 **Per-workflow override** — add a **DramaBox CLIP Loader** node, select the model you want, and connect its output to the TTS node's `dramabox_clip` input. This takes precedence over the global preference and lets you switch encoders between workflows without touching settings.
 
@@ -26,9 +31,9 @@ DramaBox uses a Gemma 3 12B text encoder. By default the node loads **`gemma_3_1
 
 The **DramaBox Options** node includes `post_generate_model_policy` with three modes:
 
-- `keep_loaded` — fastest next run, highest persistent memory usage.
-- `offload_to_cpu` — unloads DramaBox models from VRAM after generation but keeps them in CPU RAM for faster reuse.
-- `unload` — fully unloads models from both VRAM and RAM; next run reloads from disk.
+- `keep_loaded` — keep Gemma and DramaBox on GPU (fastest next run, highest VRAM usage).
+- `offload_to_cpu` — offload Gemma after text encoding and offload DramaBox to CPU after generation. (Default)
+- `offload` — offload Gemma after text encoding and fully unload DramaBox after generation.
 
 For most users, `offload_to_cpu` is a good balance between memory savings and iteration speed.
 

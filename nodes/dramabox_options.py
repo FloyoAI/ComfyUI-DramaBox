@@ -10,8 +10,41 @@ override, or leave at -1 for the recommended automatic behaviour.
 """
 
 import logging
+import os
 
 logger = logging.getLogger(__name__)
+
+
+def _get_dramabox_setting(key, default=None):
+    """Read a value from ComfyUI's persisted user settings JSON."""
+    try:
+        import json
+        import folder_paths as _fp
+
+        settings_path = os.path.join(_fp.base_path, "user", "default", "comfy.settings.json")
+        if os.path.isfile(settings_path):
+            with open(settings_path, encoding="utf-8") as _f:
+                return json.load(_f).get(key, default)
+    except Exception:
+        pass
+    return default
+
+
+def _get_dramabox_bool_setting(key: str, default: bool = False) -> bool:
+    """Read a boolean DramaBox setting with tolerant coercion."""
+    v = _get_dramabox_setting(key, default)
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        return v.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(default)
+
+
+def _default_offload_policy() -> str:
+    """Default unified policy follows global auto-offload preference."""
+    return "offload_to_cpu" if _get_dramabox_bool_setting("DramaBox.autoOffload", True) else "keep_loaded"
 
 
 class DramaBoxOptions:
@@ -28,6 +61,7 @@ class DramaBoxOptions:
 
     @classmethod
     def INPUT_TYPES(cls):
+        default_offload_policy = _default_offload_policy()
         return {
             "optional": {
                 # ── Generation ───────────────────────────────────────────────
@@ -166,15 +200,16 @@ class DramaBoxOptions:
                     },
                 ),
                 "post_generate_model_policy": (
-                    ["keep_loaded", "offload_to_cpu", "unload"],
+                    ["keep_loaded", "offload_to_cpu", "offload"],
                     {
-                        "default": "keep_loaded",
+                        "default": default_offload_policy,
                         "advanced": True,
                         "tooltip": (
-                            "Behavior after each generation:\n"
-                            "keep_loaded: fastest next run, highest persistent memory.\n"
-                            "offload_to_cpu: free VRAM but keep models in RAM for faster reuse.\n"
-                            "unload: free VRAM and RAM; next run reloads from disk."
+                            "Unified memory policy for both stages (text encode + post-generate):\n"
+                            "keep_loaded: keep Gemma and DramaBox on GPU (fastest, highest VRAM).\n"
+                            "offload_to_cpu: offload Gemma after encoding and DramaBox after generation.\n"
+                            "offload: offload Gemma after encoding and fully unload DramaBox after generation.\n"
+                            "Default follows Settings > DramaBox > Automatic model offload."
                         ),
                     },
                 ),
@@ -201,8 +236,12 @@ class DramaBoxOptions:
         duration_multiplier: float = 1.1,
         speed: float = 1.0,
         ref_duration: float = 10.0,
-        post_generate_model_policy: str = "keep_loaded",
+        post_generate_model_policy: str = "",
     ):
+        valid_policies = {"keep_loaded", "offload_to_cpu", "offload"}
+        if post_generate_model_policy not in valid_policies:
+            post_generate_model_policy = _default_offload_policy()
+
         options = {
             "steps": steps,
             "negative_prompt": negative_prompt,

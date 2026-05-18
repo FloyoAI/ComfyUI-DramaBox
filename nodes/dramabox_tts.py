@@ -775,6 +775,11 @@ class DramaBoxTTS:
             _auto_rescale(cfg_scale) if rescale_raw == "auto" else float(rescale_raw)
         )
 
+        default_policy = "offload_to_cpu" if _get_dramabox_bool_setting("DramaBox.autoOffload", True) else "keep_loaded"
+        offload_policy = str(opts.get("post_generate_model_policy", default_policy))
+        if offload_policy not in {"keep_loaded", "offload_to_cpu", "offload"}:
+            offload_policy = default_policy
+
         # ── Resolve text encoder (external CLIP or auto-loaded CLIP) ───────────
         # Both paths produce a standard comfy.sd.CLIP — same encoding code runs
         # regardless of whether the user connected a DramaBoxTextEncoderLoader.
@@ -909,9 +914,8 @@ class DramaBoxTTS:
                 a_ctx = _left_pad_ctx(a_ctx, target_len)
                 a_ctx_neg = _left_pad_ctx(a_ctx_neg, target_len)
 
-        # Default-on behavior: offload Gemma to CPU right after text encoding.
-        # Can be disabled in Comfy Settings > DramaBox > Text Encoder > Memory.
-        if _get_dramabox_bool_setting("DramaBox.offloadTextEncoderAfterEncode", True):
+        # Unified offload policy from Options (or preference-based default).
+        if offload_policy in {"offload_to_cpu", "offload"}:
             _offload_clip_patcher_to_cpu(_clip_enc)
 
         mm.soft_empty_cache()
@@ -1006,13 +1010,11 @@ class DramaBoxTTS:
         audio_dur = waveform.shape[-1] / sample_rate
         elapsed = time.time() - t_total
 
-        post_mode = str(opts.get("post_generate_model_policy", "keep_loaded"))
-
-        if post_mode == "offload_to_cpu":
-            logger.info("[DramaBox] post_generate_model_policy=offload_to_cpu")
+        if offload_policy == "offload_to_cpu":
+            logger.info("[DramaBox] offload_policy=offload_to_cpu")
             _offload_dramabox_models_to_cpu()
-        elif post_mode == "unload":
-            logger.info("[DramaBox] post_generate_model_policy=unload")
+        elif offload_policy == "offload":
+            logger.info("[DramaBox] offload_policy=offload")
             _unload_dramabox_models()
 
         return ({"waveform": waveform, "sample_rate": sample_rate},)

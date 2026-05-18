@@ -55,14 +55,15 @@ from safetensors import safe_open
 
 
 DEFAULT_NEG = "worst quality, inconsistent, robotic, distorted, noise, static, muffled, unclear, unnatural, monotone"
+_AUTO_DURATION_SAFETY_PAD_SEC = 0.8
 
 
-def estimate_duration(prompt, multiplier=1.1):
+def estimate_duration(prompt, multiplier=1.1, speed=1.0):
     """Defer to the richer CLI estimator (sentence-aware + non-verbal action
     budget) so warm-server outputs match the lengths of the per-call CLI runs."""
     from inference import estimate_speech_duration
-    base = estimate_speech_duration(prompt)
-    return max(3.0, round(base * multiplier, 1))
+    base = estimate_speech_duration(prompt, speed)
+    return max(3.0, round(base * multiplier + _AUTO_DURATION_SAFETY_PAD_SEC, 1))
 
 
 def auto_rescale_for_cfg(cfg: float) -> float:
@@ -205,7 +206,7 @@ class TTSServer:
             model_sd_ops=audio_sd_ops,
             registry=DummyRegistry(),
         )
-        self._velocity_model = builder.build(device=self.device, dtype=self.dtype).to(self.device).eval()
+        self._velocity_model = builder.build(device=self.device, dtype=self.dtype).eval()
         n_params = sum(p.numel() for p in self._velocity_model.parameters()) / 1e9
         vram_gb = sum(p.numel() * p.element_size() for p in self._velocity_model.parameters()) / 1e9
         logging.info(f"  Transformer: {time.time()-t0:.1f}s ({n_params:.1f}B params, {vram_gb:.1f}GB VRAM, {self.dtype})")
@@ -229,7 +230,7 @@ class TTSServer:
     @torch.inference_mode()
     def generate(self, prompt, voice_ref=None, cfg_scale=2.5, stg_scale=1.5,
                  duration_multiplier=1.1, seed=42, ref_duration=10.0,
-                 rescale_scale="auto", gen_duration: float = 0.0):
+                 rescale_scale="auto", gen_duration: float = 0.0, speed: float = 1.0):
         """Generate audio. Returns (waveform_path, duration_seconds).
 
         rescale_scale: latent-side CFG std-rescale that prevents clipping at
@@ -244,7 +245,7 @@ class TTSServer:
         if gen_duration and gen_duration > 0:
             gen_dur = float(gen_duration)
         else:
-            gen_dur = estimate_duration(prompt, duration_multiplier)
+            gen_dur = estimate_duration(prompt, duration_multiplier, speed=float(speed))
         fps = 25.0
         n_frames = int(round(gen_dur * fps)) + 1
         n_frames = ((n_frames - 1 + 4) // 8) * 8 + 1

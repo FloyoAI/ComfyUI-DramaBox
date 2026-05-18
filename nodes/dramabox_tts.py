@@ -48,6 +48,40 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 
+
+class _SuppressAudioOnlyInitNoise(logging.Filter):
+    """Filter known harmless missing-init logs for stripped audio-only branches."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage().lower()
+        except Exception:
+            return True
+
+        if "initialized parameters or buffers" not in msg:
+            return True
+
+        if "feature_extractor.video_aggregate_embed" in msg:
+            return False
+        if "video_connector." in msg:
+            return False
+
+        return True
+
+
+def _install_noise_filters() -> None:
+    filt = _SuppressAudioOnlyInitNoise()
+    targets = (
+        logging.getLogger(),
+        logging.getLogger("ltx_core.loader.single_gpu_model_builder"),
+        logging.getLogger("ltx_core.loader.module_ops"),
+    )
+    for target in targets:
+        target.addFilter(filt)
+
+
+_install_noise_filters()
+
 # ── local import bootstrap ────────────────────────────────────────────────────
 _NODE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -77,6 +111,7 @@ def _get_models_dir() -> str:
 _DEFAULT_NEG = (
     "worst quality, inconsistent, robotic, distorted, noise, static, muffled, unclear, unnatural, monotone"
 )
+_AUTO_DURATION_SAFETY_PAD_SEC = 0.8
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -595,6 +630,131 @@ def _resolve_lora_path(lora_name: str) -> str | None:
     return None
 
 
+def _detect_lora_rank(lora_path: str) -> int | None:
+    """Best-effort LoRA rank detection from a safetensors adapter file."""
+    try:
+        from safetensors import safe_open
+    except Exception:
+        return None
+
+    try:
+        with safe_open(str(lora_path), framework="pt") as f:
+            keys = list(f.keys())
+
+            for key in keys:
+                if key.endswith(".lora_A.weight"):
+                    tensor = f.get_tensor(key)
+                    if tensor.ndim >= 2 and tensor.shape[0] > 0:
+                        return int(tensor.shape[0])
+
+            for key in keys:
+                if key.endswith(".lora_B.weight"):
+                    tensor = f.get_tensor(key)
+                    if tensor.ndim >= 2 and tensor.shape[1] > 0:
+                        return int(tensor.shape[1])
+    except Exception:
+        return None
+
+    return None
+
+
+def _normalize_lora_stack(lora_stack) -> list[tuple[str, float, float]]:
+    """Normalize common ComfyUI LoRA stack variants.
+
+    Returns a list of (lora_name_or_path, strength_model, strength_clip).
+    """
+    if not lora_stack:
+        return []
+
+    source = lora_stack
+    if isinstance(source, dict):
+        for key in ("lora_stack", "stack", "loras", "items", "value"):
+            if key in source:
+                source = source.get(key)
+                break
+        else:
+            return []
+
+    if isinstance(source, (str, Path)):
+        return [(str(source), 1.0, 1.0)]
+
+    if isinstance(source, tuple) and source and isinstance(source[0], (str, Path)):
+        items = [source]
+    elif isinstance(source, list):
+        items = source
+    elif isinstance(source, tuple):
+        items = list(source)
+    else:
+        items = [source]
+
+    normalized: list[tuple[str, float, float]] = []
+    for item in items:
+        name = None
+        strength_model = 1.0
+        strength_clip = 1.0
+
+        if isinstance(item, (str, Path)):
+            name = str(item)
+        elif isinstance(item, dict):
+            name = item.get("lora_name") or item.get("name") or item.get("path") or item.get("lora")
+            strength_model = item.get("strength_model", item.get("strength", 1.0))
+            strength_clip = item.get("strength_clip", 1.0)
+        elif isinstance(item, (list, tuple)):
+            if len(item) >= 3:
+                name, strength_model, strength_clip = item[0], item[1], item[2]
+            elif len(item) == 2:
+                name, strength_model = item[0], item[1]
+            elif len(item) == 1:
+                name = item[0]
+
+        if name is None:
+            continue
+
+        try:
+            strength_model = float(strength_model)
+        except Exception:
+            strength_model = 1.0
+        try:
+            strength_clip = float(strength_clip)
+        except Exception:
+            strength_clip = 1.0
+
+        normalized.append((str(name), strength_model, strength_clip))
+
+    return normalized
+
+
+def _resolve_wrapper_loras(lora_stack) -> list[tuple[str, float, int]]:
+    """Resolve wrapper-mode LoRA stack for one-shot OG invocation.
+
+    Returns:
+        [(lora_path, strength, lora_rank), ...]
+    """
+    normalized_stack = _normalize_lora_stack(lora_stack)
+    if not normalized_stack:
+        return []
+
+    resolved: list[tuple[str, float, int]] = []
+    for lora_name, strength_model, _strength_clip in normalized_stack:
+        path = _resolve_lora_path(lora_name)
+        if path is None:
+            logger.warning("[DramaBox] LoRA not found for wrapper mode, skipping: %s", lora_name)
+            continue
+
+        try:
+            strength_val = float(strength_model)
+        except Exception:
+            strength_val = 1.0
+
+        if strength_val <= 0:
+            continue
+
+        lora_rank = _detect_lora_rank(path) or 128
+        resolved.append((path, strength_val, int(lora_rank)))
+
+    return resolved
+
+
 def _apply_lora_deltas(transformer: torch.nn.Module, lora_path: str, strength: float) -> list:
     """Apply LoRA weights to transformer in-place using manual delta math.
 
@@ -635,6 +795,13 @@ def _apply_lora_deltas(transformer: torch.nn.Module, lora_path: str, strength: f
                 pairs.setdefault(pp, {})["B"] = v
 
     param_dict = dict(transformer.named_parameters())
+    key_prefixes = (
+        "_orig_mod.",
+        "model.",
+        "module.",
+        "_orig_mod.model.",
+        "model._orig_mod.",
+    )
     applied: list[tuple[str, torch.Tensor]] = []
 
     for pp, pair in pairs.items():
@@ -645,10 +812,18 @@ def _apply_lora_deltas(transformer: torch.nn.Module, lora_path: str, strength: f
         scale = strength  # alpha == rank by default (scale = alpha/rank * strength = strength)
 
         weight_key = pp + ".weight"
-        if weight_key not in param_dict:
+        resolved_key = weight_key
+        if resolved_key not in param_dict:
+            for prefix in key_prefixes:
+                candidate = prefix + weight_key
+                if candidate in param_dict:
+                    resolved_key = candidate
+                    break
+
+        if resolved_key not in param_dict:
             continue
 
-        param = param_dict[weight_key]
+        param = param_dict[resolved_key]
         dev, dt = param.device, param.dtype
 
         # delta = scale * lora_B @ lora_A   (computed in float32 for precision)
@@ -658,7 +833,7 @@ def _apply_lora_deltas(transformer: torch.nn.Module, lora_path: str, strength: f
         ).to(dtype=dt)
 
         param.data.add_(delta)
-        applied.append((weight_key, delta))
+        applied.append((resolved_key, delta))
 
     return applied
 
@@ -724,7 +899,7 @@ def _offload_dramabox_models_to_cpu():
     logger.info("[DramaBox] Cached models offloaded to CPU (kept in RAM).")
 
 
-def _unload_dramabox_models():
+def _unload_dramabox_models() -> int:
     """Free all DramaBox model weights from GPU and CPU RAM.
 
     Unpatches all ComfyUI-managed ModelPatchers (moving them to CPU), removes
@@ -735,9 +910,11 @@ def _unload_dramabox_models():
     import gc
     import comfy.model_management as mm
 
-    if not _LOADED_MODELS and not _LOADED_TEXT_ENCODER:
+    released = len(_LOADED_MODELS) + len(_LOADED_TEXT_ENCODER)
+
+    if released <= 0:
         logger.info("[DramaBox] No models loaded — nothing to free.")
-        return
+        return 0
 
     # Collect all internally-managed patchers (external CLIP is user-managed)
     all_patchers = _collect_dramabox_patchers()
@@ -758,7 +935,8 @@ def _unload_dramabox_models():
     _LOADED_TEXT_ENCODER.clear()
     gc.collect()
     mm.soft_empty_cache()
-    logger.info("[DramaBox] All models unloaded. VRAM freed.")
+    logger.info("[DramaBox] All clip_loader models unloaded. VRAM freed.")
+    return released
 
 
 def _normalize_generation_mode(mode) -> str:
@@ -766,6 +944,11 @@ def _normalize_generation_mode(mode) -> str:
     if mode in {"clip_loader", "dramabox_wrapper"}:
         return mode
     return "clip_loader"
+
+
+def _default_generation_mode() -> str:
+    """Default generation mode from global DramaBox preference."""
+    return "dramabox_wrapper" if _get_dramabox_bool_setting("DramaBox.defaultWrapperMode", False) else "clip_loader"
 
 
 def _apply_dramabox_wrapper_compat(force: bool = False) -> None:
@@ -1013,6 +1196,40 @@ def _release_og_server(device):
             torch.cuda.empty_cache()
 
 
+def unload_og_servers() -> int:
+    """Release all cached DramaBox_Wrapper servers and free VRAM cache.
+
+    Returns:
+        Number of cached OG server entries that were released.
+    """
+    import gc
+
+    released = len(_OG_SERVER_CACHE)
+    if released <= 0:
+        return 0
+
+    for key in list(_OG_SERVER_CACHE.keys()):
+        del _OG_SERVER_CACHE[key]
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    logger.info("[DramaBox] Released %d cached OG server(s)", released)
+    return released
+
+
+def unload_all_dramabox_caches() -> tuple[int, int]:
+    """Unload both clip_loader caches and OG wrapper caches.
+
+    Returns:
+        (clip_loader_released, og_released)
+    """
+    clip_released = _unload_dramabox_models()
+    og_released = unload_og_servers()
+    return clip_released, og_released
+
+
 def _voice_ref_to_temp_wav(voice_ref):
     """Write ComfyUI AUDIO input to a temporary wav file and return its path."""
     if voice_ref is None:
@@ -1033,6 +1250,111 @@ def _voice_ref_to_temp_wav(voice_ref):
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         sf.write(tmp.name, wav, int(sample_rate))
         return tmp.name
+
+
+def _run_og_low_memory_once(
+    prompt: str,
+    *,
+    seed: int,
+    voice_ref_path: str | None,
+    speed: float,
+    cfg_scale: float,
+    stg_scale: float,
+    duration_multiplier: float,
+    ref_duration: float,
+    gen_duration: float,
+    steps: int,
+    negative_prompt: str,
+    rescale_raw,
+    lora_entries: list[tuple[str, float, int]] | None = None,
+) -> tuple[torch.Tensor, int]:
+    """Run OG inference in one-shot mode (VCS-style low-memory path)."""
+    import subprocess
+    import tempfile
+    import soundfile as sf
+
+    from model_downloader import get_gemma_path, get_model_path
+
+    models_dir = _get_models_dir()
+    ckpt_transformer = get_model_path("transformer", cache_dir=models_dir)
+    ckpt_audio = get_model_path("audio_components", cache_dir=models_dir)
+    gemma_root = get_gemma_path(cache_dir=models_dir)
+
+    infer_script = os.path.join(_SRC_DIR, "inference.py")
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_out:
+        output_path = tmp_out.name
+
+    cmd = [
+        sys.executable,
+        infer_script,
+        "--prompt",
+        str(prompt),
+        "--output",
+        output_path,
+        "--seed",
+        str(int(seed)),
+        "--checkpoint",
+        str(ckpt_transformer),
+        "--full-checkpoint",
+        str(ckpt_audio),
+        "--gemma-root",
+        str(gemma_root),
+        "--cfg-scale",
+        str(float(cfg_scale)),
+        "--stg-scale",
+        str(float(stg_scale)),
+        "--duration-multiplier",
+        str(float(duration_multiplier)),
+        "--speed",
+        str(float(speed)),
+        "--ref-duration",
+        str(float(ref_duration)),
+        "--steps",
+        str(int(steps)),
+        "--negative-prompt",
+        str(negative_prompt),
+        "--no-watermark",
+    ]
+
+    if gen_duration and float(gen_duration) > 0:
+        cmd.extend(["--gen-duration", str(float(gen_duration))])
+
+    if rescale_raw != "auto":
+        cmd.extend(["--rescale-scale", str(float(rescale_raw))])
+
+    if voice_ref_path:
+        cmd.extend(["--voice-sample", str(voice_ref_path)])
+    else:
+        cmd.append("--no-ref")
+
+    if lora_entries:
+        for lora_path, lora_strength, lora_rank in lora_entries:
+            cmd.extend(
+                [
+                    "--lora",
+                    str(lora_path),
+                    "--lora-strength",
+                    str(float(lora_strength)),
+                    "--lora-rank",
+                    str(int(lora_rank)),
+                ]
+            )
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            stderr_tail = (proc.stderr or "").strip().splitlines()[-20:]
+            raise RuntimeError("Low-memory OG inference failed:\n" + "\n".join(stderr_tail))
+
+        wav_np, sample_rate = sf.read(output_path, dtype="float32", always_2d=True)
+        waveform = torch.from_numpy(wav_np.T).unsqueeze(0)
+        return waveform, int(sample_rate)
+    finally:
+        try:
+            os.unlink(output_path)
+        except OSError:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1159,7 +1481,13 @@ class DramaBoxTTS:
                 pass
 
         opts = options or {}
-        generation_mode = _normalize_generation_mode(opts.get("generation_mode", "clip_loader"))
+        normalized_lora_stack = _normalize_lora_stack(lora_stack)
+        if lora_stack and not normalized_lora_stack:
+            print("[DramaBox] Warning: lora_stack input was provided but no valid entries were parsed.")
+        elif normalized_lora_stack:
+            print(f"[DramaBox] LoRA stack parsed: {len(normalized_lora_stack)} adapter(s)")
+
+        generation_mode = _normalize_generation_mode(opts.get("generation_mode", _default_generation_mode()))
         attention_policy = str(opts.get("attention_policy", "best_available"))
         ref_duration: float  = opts.get("ref_duration", 10.0)
         gen_duration: float  = opts.get("gen_duration", 0.0)
@@ -1180,24 +1508,79 @@ class DramaBoxTTS:
 
         if generation_mode == "dramabox_wrapper":
             logger.info("[DramaBox] generation_mode=dramabox_wrapper")
-            if lora_stack:
-                logger.warning("[DramaBox] LoRA stack is not applied in dramabox_wrapper mode.")
+            server = None
+            _applied_deltas: list = []
 
-            server = _get_og_server(device)
             tmp_voice_path = _voice_ref_to_temp_wav(voice_ref)
             try:
-                waveform, sample_rate = server.generate(
-                    prompt=used_prompt,
-                    voice_ref=tmp_voice_path,
-                    cfg_scale=cfg_scale,
-                    stg_scale=stg_scale,
-                    duration_multiplier=duration_mult,
-                    seed=int(seed),
-                    ref_duration=float(ref_duration),
-                    rescale_scale=rescale_raw,
-                    gen_duration=float(gen_duration),
-                )
+                if normalized_lora_stack:
+                    server = _get_og_server(device)
+                    for lora_name, strength_model, _strength_clip in normalized_lora_stack:
+                        lora_path = _resolve_lora_path(lora_name)
+                        if lora_path is None:
+                            logger.warning("[DramaBox] LoRA not found, skipping: %s", lora_name)
+                            print(f"[DramaBox] Wrapper LoRA missing: {lora_name}")
+                            continue
+                        deltas = _apply_lora_deltas(server._velocity_model, lora_path, float(strength_model))
+                        _applied_deltas.extend(deltas)
+                        print(
+                            f"[DramaBox] Wrapper LoRA applied: {os.path.basename(lora_path)} "
+                            f"(strength={float(strength_model):.2f}, params={len(deltas)})"
+                        )
+                        if not deltas:
+                            print(
+                                f"[DramaBox] Warning: no matching transformer params found for "
+                                f"{os.path.basename(lora_path)}"
+                            )
+
+                    waveform, sample_rate = server.generate(
+                        prompt=used_prompt,
+                        voice_ref=tmp_voice_path,
+                        speed=speed,
+                        cfg_scale=cfg_scale,
+                        stg_scale=stg_scale,
+                        duration_multiplier=duration_mult,
+                        seed=int(seed),
+                        ref_duration=float(ref_duration),
+                        rescale_scale=rescale_raw,
+                        gen_duration=float(gen_duration),
+                    )
+                elif offload_policy in {"offload_to_cpu", "offload"}:
+                    if offload_policy in {"offload_to_cpu", "offload"}:
+                        logger.info("[DramaBox] dramabox_wrapper + offload policy -> one-shot low-memory run")
+                    _release_og_server(device)
+                    waveform, sample_rate = _run_og_low_memory_once(
+                        used_prompt,
+                        seed=int(seed),
+                        voice_ref_path=tmp_voice_path,
+                        speed=speed,
+                        cfg_scale=cfg_scale,
+                        stg_scale=stg_scale,
+                        duration_multiplier=duration_mult,
+                        ref_duration=float(ref_duration),
+                        gen_duration=float(gen_duration),
+                        steps=steps,
+                        negative_prompt=negative_prompt,
+                        rescale_raw=rescale_raw,
+                    )
+                else:
+                    server = _get_og_server(device)
+                    waveform, sample_rate = server.generate(
+                        prompt=used_prompt,
+                        voice_ref=tmp_voice_path,
+                        speed=speed,
+                        cfg_scale=cfg_scale,
+                        stg_scale=stg_scale,
+                        duration_multiplier=duration_mult,
+                        seed=int(seed),
+                        ref_duration=float(ref_duration),
+                        rescale_scale=rescale_raw,
+                        gen_duration=float(gen_duration),
+                    )
             finally:
+                if _applied_deltas and server is not None:
+                    _remove_lora_deltas(server._velocity_model, _applied_deltas)
+                    _applied_deltas.clear()
                 if tmp_voice_path:
                     try:
                         os.unlink(tmp_voice_path)
@@ -1261,12 +1644,13 @@ class DramaBoxTTS:
             gen_dur = float(gen_duration)
         else:
             est_base = estimate_speech_duration(used_prompt, speed)
-            gen_dur = max(3.0, round(est_base * duration_mult, 1))
+            gen_dur = max(3.0, round(est_base * duration_mult + _AUTO_DURATION_SAFETY_PAD_SEC, 1))
             logger.info(
-                "[DramaBox] Auto duration: base=%.1fs, multiplier=%.2f, speed=%.2f -> target=%.1fs",
+                "[DramaBox] Auto duration: base=%.1fs, multiplier=%.2f, speed=%.2f, safety=%.1fs -> target=%.1fs",
                 est_base,
                 duration_mult,
                 speed,
+                _AUTO_DURATION_SAFETY_PAD_SEC,
                 gen_dur,
             )
         fps = 25.0
@@ -1393,18 +1777,24 @@ class DramaBoxTTS:
         # subtracted after inference so the cached transformer stays unmodified.
         xfmr_patchers = model["xfmr_patchers"]
         _applied_deltas: list = []  # [(weight_key, delta_tensor), …]
-        if lora_stack:
-            for lora_name, strength_model, _strength_clip in lora_stack:
+        if normalized_lora_stack:
+            for lora_name, strength_model, _strength_clip in normalized_lora_stack:
                 lora_path = _resolve_lora_path(lora_name)
                 if lora_path is None:
                     logger.warning("[DramaBox] LoRA not found, skipping: %s", lora_name)
+                    print(f"[DramaBox] LoRA missing: {lora_name}")
                     continue
                 deltas = _apply_lora_deltas(transformer, lora_path, float(strength_model))
                 _applied_deltas.extend(deltas)
-                logger.info(
-                    "[DramaBox] LoRA applied: %s (strength=%.2f, params=%d)",
-                    os.path.basename(lora_path), strength_model, len(deltas),
+                print(
+                    f"[DramaBox] LoRA applied: {os.path.basename(lora_path)} "
+                    f"(strength={float(strength_model):.2f}, params={len(deltas)})"
                 )
+                if not deltas:
+                    print(
+                        f"[DramaBox] Warning: no matching transformer params found for "
+                        f"{os.path.basename(lora_path)}"
+                    )
         mm.load_models_gpu(xfmr_patchers)
         logger.info(
             "[DramaBox] Denoising (%d steps, cfg=%.1f, stg=%.1f)…",

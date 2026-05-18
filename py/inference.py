@@ -35,6 +35,40 @@ from pathlib import Path
 import soundfile as sf
 import torch
 
+
+class _SuppressAudioOnlyInitNoise(logging.Filter):
+    """Filter known harmless missing-init logs for stripped audio-only branches."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage().lower()
+        except Exception:
+            return True
+
+        if "initialized parameters or buffers" not in msg:
+            return True
+
+        if "feature_extractor.video_aggregate_embed" in msg:
+            return False
+        if "video_connector." in msg:
+            return False
+
+        return True
+
+
+def _install_noise_filters() -> None:
+    filt = _SuppressAudioOnlyInitNoise()
+    targets = (
+        logging.getLogger(),
+        logging.getLogger("ltx_core.loader.single_gpu_model_builder"),
+        logging.getLogger("ltx_core.loader.module_ops"),
+    )
+    for target in targets:
+        target.addFilter(filt)
+
+
+_install_noise_filters()
+
 REPO_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Also add the local directory so audio_conditioning.py is importable
@@ -44,6 +78,7 @@ if _src_dir not in sys.path:
 
 MODEL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
 GEMMA_DIR = os.environ.get("GEMMA_DIR", "gemma-3-12b-it-qat-q4_0-unquantized")
+_AUTO_DURATION_SAFETY_PAD_SEC = 0.8
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +255,98 @@ def estimate_speech_duration(text: str, speed: float = 1.0) -> float:
     return max(3.0, round(duration + 2.0, 1))
 
 
+def _expand_cli_values(values, target_len: int, default):
+    """Expand CLI list values to target length using sensible fallback rules."""
+    if target_len <= 0:
+        return []
+    if not values:
+        return [default] * target_len
+
+    out = list(values)
+    if len(out) == 1 and target_len > 1:
+        return [out[0]] * target_len
+    if len(out) < target_len:
+        out.extend([out[-1]] * (target_len - len(out)))
+    return out[:target_len]
+
+
+def _apply_lora_deltas(transformer: torch.nn.Module, lora_path: str, strength: float) -> list:
+    """Apply LoRA deltas directly to transformer weights.
+
+    Supports both PEFT-style and original ID-LoRA key formats.
+    Returns applied (weight_key, delta_tensor) tuples for diagnostics.
+    """
+    from safetensors.torch import load_file as _st_load
+
+    lora_sd = _st_load(lora_path)
+    is_peft = any("base_model.model." in k for k in lora_sd)
+    is_idlora = any("diffusion_model." in k for k in lora_sd)
+
+    pairs: dict[str, dict] = {}
+    for k, v in lora_sd.items():
+        if is_peft:
+            if "base_model.model." not in k:
+                continue
+            base = k.replace("base_model.model.", "")
+            if ".lora_A." in base:
+                pp = base[: base.index(".lora_A.")]
+                pairs.setdefault(pp, {})["A"] = v
+            elif ".lora_B." in base:
+                pp = base[: base.index(".lora_B.")]
+                pairs.setdefault(pp, {})["B"] = v
+        elif is_idlora:
+            if "diffusion_model." not in k:
+                continue
+            base = k.replace("diffusion_model.", "")
+            if ".lora_A.weight" in base:
+                pp = base.replace(".lora_A.weight", "")
+                pairs.setdefault(pp, {})["A"] = v
+            elif ".lora_B.weight" in base:
+                pp = base.replace(".lora_B.weight", "")
+                pairs.setdefault(pp, {})["B"] = v
+
+    param_dict = dict(transformer.named_parameters())
+    key_prefixes = (
+        "_orig_mod.",
+        "model.",
+        "module.",
+        "_orig_mod.model.",
+        "model._orig_mod.",
+    )
+    applied = []
+
+    for pp, pair in pairs.items():
+        if "A" not in pair or "B" not in pair:
+            continue
+
+        lora_A = pair["A"]
+        lora_B = pair["B"]
+
+        weight_key = pp + ".weight"
+        resolved_key = weight_key
+        if resolved_key not in param_dict:
+            for prefix in key_prefixes:
+                candidate = prefix + weight_key
+                if candidate in param_dict:
+                    resolved_key = candidate
+                    break
+
+        if resolved_key not in param_dict:
+            continue
+
+        param = param_dict[resolved_key]
+        dev, dt = param.device, param.dtype
+        delta = strength * (
+            lora_B.to(device=dev, dtype=torch.float32)
+            @ lora_A.to(device=dev, dtype=torch.float32)
+        ).to(dtype=dt)
+
+        param.data.add_(delta)
+        applied.append((resolved_key, delta))
+
+    return applied
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="LTX-2.3 TTS with IC-LoRA voice cloning")
 
@@ -249,8 +376,35 @@ def parse_args():
     p.add_argument("--no-bnb-4bit", dest="bnb_4bit", action="store_false",
                    help="Disable the bitsandbytes path (use only if --gemma-root "
                         "points at an unquantized Gemma checkpoint).")
-    p.add_argument("--lora", default=None, help="Path to trained IC-LoRA .safetensors (audio-only)")
-    p.add_argument("--lora-rank", type=int, default=128, help="LoRA rank (must match training)")
+    p.add_argument(
+        "--lora",
+        action="append",
+        default=[],
+        help=(
+            "Path to trained IC-LoRA .safetensors (audio-only). "
+            "Can be provided multiple times to stack adapters."
+        ),
+    )
+    p.add_argument(
+        "--lora-rank",
+        type=int,
+        action="append",
+        default=[],
+        help=(
+            "Optional rank hint for each --lora (kept for compatibility). "
+            "Can be provided multiple times; if omitted defaults to 128."
+        ),
+    )
+    p.add_argument(
+        "--lora-strength",
+        type=float,
+        action="append",
+        default=[],
+        help=(
+            "Strength for each --lora adapter (default 1.0). "
+            "Can be provided multiple times."
+        ),
+    )
     p.add_argument("--id-guidance-scale", type=float, default=3.0, help="Identity guidance scale (0=disabled)")
     p.add_argument("--seed", type=int, default=42)
 
@@ -346,11 +500,19 @@ def main():
 
     # ---- Auto duration ----
     if args.gen_duration <= 0:
-        args.gen_duration = estimate_speech_duration(args.prompt, args.speed)
-        if args.duration_multiplier != 1.0:
-            args.gen_duration = round(args.gen_duration * args.duration_multiplier, 1)
-        logging.info(f"Auto duration: {args.gen_duration}s for {len(args.prompt)} chars"
-                     f"{f' (x{args.duration_multiplier})' if args.duration_multiplier != 1.0 else ''}")
+        base_dur = estimate_speech_duration(args.prompt, args.speed)
+        args.gen_duration = max(
+            3.0,
+            round(base_dur * args.duration_multiplier + _AUTO_DURATION_SAFETY_PAD_SEC, 1),
+        )
+        logging.info(
+            "Auto duration: base=%.1fs, x%.2f + %.1fs safety -> %.1fs for %d chars",
+            base_dur,
+            args.duration_multiplier,
+            _AUTO_DURATION_SAFETY_PAD_SEC,
+            args.gen_duration,
+            len(args.prompt),
+        )
 
     # ---- Compute target shape (include pad_start in duration) ----
     padded_duration = args.gen_duration + args.pad_start
@@ -426,7 +588,7 @@ def main():
     use_cfg = args.cfg_scale > 1.0
     logging.info("Encoding prompt...")
     pe = PromptEncoder(checkpoint_path=args.full_checkpoint, gemma_root=args.gemma_root, dtype=dtype, device=device,
-                       use_bnb_4bit=args.bnb_4bit, warm=True)
+                       use_bnb_4bit=args.bnb_4bit, warm=True, audio_only=True)
     prompts_to_encode = [args.prompt]
     if use_cfg:
         prompts_to_encode.append(args.negative_prompt)
@@ -500,69 +662,34 @@ def main():
         model_sd_ops=audio_only_sd_ops,
         registry=DummyRegistry(),
     )
-    velocity_model = builder.build(device=device, dtype=dtype).to(device).eval()
+    velocity_model = builder.build(device=device, dtype=dtype).eval()
 
     # ---- Load LoRA weights (if provided) ----
-    if args.lora and os.path.exists(args.lora):
-        from peft import LoraConfig, get_peft_model
-        from safetensors.torch import load_file as st_load
+    lora_paths = [str(p) for p in (args.lora or []) if p]
+    if lora_paths:
+        strengths = _expand_cli_values(args.lora_strength, len(lora_paths), 1.0)
+        ranks = _expand_cli_values(args.lora_rank, len(lora_paths), 128)
 
-        logging.info(f"Loading LoRA: {args.lora}")
-        lora_sd = st_load(args.lora)
+        for idx, (lora_path, strength, rank_hint) in enumerate(zip(lora_paths, strengths, ranks), start=1):
+            if not os.path.exists(lora_path):
+                logging.warning("LoRA %d/%d not found, skipping: %s", idx, len(lora_paths), lora_path)
+                continue
 
-        is_peft_format = any("base_model.model." in k for k in lora_sd.keys())
-        is_original_idlora = any("diffusion_model." in k for k in lora_sd.keys())
+            strength = float(strength)
+            if strength <= 0:
+                logging.info("LoRA %d/%d skipped (strength <= 0): %s", idx, len(lora_paths), lora_path)
+                continue
 
-        lora_config = LoraConfig(
-            r=args.lora_rank,
-            lora_alpha=args.lora_rank,
-            lora_dropout=0.0,
-            bias="none",
-            target_modules=[
-                "audio_attn1.to_k",
-                "audio_attn1.to_q",
-                "audio_attn1.to_v",
-                "audio_attn1.to_out.0",
-                "audio_attn2.to_k",
-                "audio_attn2.to_q",
-                "audio_attn2.to_v",
-                "audio_attn2.to_out.0",
-                "audio_ff.net.0.proj",
-                "audio_ff.net.2",
-            ],
-        )
-        velocity_model = get_peft_model(velocity_model, lora_config)
-
-        if is_peft_format:
-            mapped_sd = {}
-            for k, v in lora_sd.items():
-                new_key = k
-                if ".lora_A.weight" in k and ".lora_A.default.weight" not in k:
-                    new_key = k.replace(".lora_A.weight", ".lora_A.default.weight")
-                if ".lora_B.weight" in k and ".lora_B.default.weight" not in k:
-                    new_key = k.replace(".lora_B.weight", ".lora_B.default.weight")
-                mapped_sd[new_key] = v
-            missing, unexpected = velocity_model.load_state_dict(mapped_sd, strict=False)
-            loaded = len(mapped_sd) - len(unexpected)
-            logging.info(f"Loaded {loaded} LoRA weights (peft format)")
-        elif is_original_idlora:
-            audio_keys = {
-                k: v
-                for k, v in lora_sd.items()
-                if "audio_attn1" in k or "audio_attn2" in k or "audio_ff" in k
-            }
-            mapped_sd = {}
-            for k, v in audio_keys.items():
-                new_key = k.replace("diffusion_model.", "base_model.model.")
-                new_key = new_key.replace(".lora_A.weight", ".lora_A.default.weight")
-                new_key = new_key.replace(".lora_B.weight", ".lora_B.default.weight")
-                mapped_sd[new_key] = v
-            missing, unexpected = velocity_model.load_state_dict(mapped_sd, strict=False)
-            loaded = len(mapped_sd) - len(unexpected)
-            logging.info(f"Loaded {loaded} LoRA weights (original ID-LoRA)")
-
-        velocity_model = velocity_model.merge_and_unload()
-        logging.info("Merged LoRA into model")
+            applied = _apply_lora_deltas(velocity_model, lora_path, strength)
+            logging.info(
+                "Applied LoRA %d/%d: %s (strength=%.3f, rank_hint=%s, params=%d)",
+                idx,
+                len(lora_paths),
+                os.path.basename(lora_path),
+                strength,
+                rank_hint,
+                len(applied),
+            )
 
     logging.info(f"Model: {sum(p.numel() for p in velocity_model.parameters()) / 1e9:.1f}B params")
 
@@ -588,15 +715,33 @@ def main():
     # ---- Denoiser: use GuidedDenoiser if any guidance is active, SimpleDenoiser otherwise ----
     needs_guidance = args.cfg_scale > 1.0 or args.stg_scale > 0.0 or args.modality_scale > 1.0
     if needs_guidance:
+        guider_params_kwargs = {
+            "cfg_scale": args.cfg_scale,
+            "stg_scale": args.stg_scale,
+            "stg_blocks": [args.stg_block] if args.stg_scale > 0 else [],
+            "rescale_scale": args.rescale_scale,
+            "modality_scale": args.modality_scale,
+        }
+        if args.cfg_clamp is not None:
+            guider_params_kwargs["cfg_clamp_scale"] = args.cfg_clamp
+
+        try:
+            guider_params = MultiModalGuiderParams(**guider_params_kwargs)
+        except TypeError as exc:
+            # Older ltx_core versions do not expose cfg_clamp_scale yet.
+            if "cfg_clamp_scale" in str(exc):
+                guider_params_kwargs.pop("cfg_clamp_scale", None)
+                guider_params = MultiModalGuiderParams(**guider_params_kwargs)
+                if args.cfg_clamp not in (None, 0, 0.0):
+                    logging.warning(
+                        "Installed ltx_core does not support cfg_clamp_scale; ignoring --cfg-clamp=%.3f",
+                        float(args.cfg_clamp),
+                    )
+            else:
+                raise
+
         audio_guider = MultiModalGuider(
-            params=MultiModalGuiderParams(
-                cfg_scale=args.cfg_scale,
-                stg_scale=args.stg_scale,
-                stg_blocks=[args.stg_block] if args.stg_scale > 0 else [],
-                rescale_scale=args.rescale_scale,
-                modality_scale=args.modality_scale,
-                cfg_clamp_scale=args.cfg_clamp,
-            ),
+            params=guider_params,
             negative_context=a_ctx_neg,
         )
         denoiser = GuidedDenoiser(

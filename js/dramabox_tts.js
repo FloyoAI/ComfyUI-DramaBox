@@ -180,6 +180,19 @@ app.registerExtension({
                 "encoding and offloads DramaBox models to CPU after generation. Disable " +
                 "if you have very high VRAM and prefer maximum throughput.",
         },
+        {
+            id: "DramaBox.defaultWrapperMode",
+            name: "Use DramaBox Wrapper mode by default",
+            category: ["DramaBox", "Generation"],
+            type: "boolean",
+            defaultValue: false,
+            tooltip:
+                "ON: DramaBox TTS uses a DramaBox Wrapper by default (unless an Options node overrides it). " +
+                "OFF: DramaBox TTS uses a clip_loader by default (best ComfyUI VRAM control). " +
+                "Wrapper LoRA support: supports LoRA stacks and strengths. " +
+                "Wrapper side effects: ComfyUI cannot fully manage wrapper VRAM, so VRAM may stay allocated. " +
+                "Use offload/unload policy or the DramaBox Unload node to free memory after runs.",
+        },
     ],
 });
 

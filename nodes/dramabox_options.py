@@ -47,6 +47,11 @@ def _default_offload_policy() -> str:
     return "offload_to_cpu" if _get_dramabox_bool_setting("DramaBox.autoOffload", True) else "keep_loaded"
 
 
+def _default_generation_mode() -> str:
+    """Default generation mode follows global DramaBox preference."""
+    return "dramabox_wrapper" if _get_dramabox_bool_setting("DramaBox.defaultWrapperMode", False) else "clip_loader"
+
+
 class DramaBoxOptions:
     """Advanced generation options for DramaBox TTS."""
 
@@ -62,6 +67,7 @@ class DramaBoxOptions:
     @classmethod
     def INPUT_TYPES(cls):
         default_offload_policy = _default_offload_policy()
+        default_generation_mode = _default_generation_mode()
         return {
             "optional": {
                 # ── Generation ───────────────────────────────────────────────
@@ -229,12 +235,15 @@ class DramaBoxOptions:
                 "generation_mode": (
                     ["clip_loader", "dramabox_wrapper"],
                     {
-                        "default": "clip_loader",
+                        "default": default_generation_mode,
                         "advanced": True,
                         "tooltip": (
                             "Generation path selection:\n"
-                            "clip_loader: Comfy CLIP/GGUF-friendly path with strong VRAM management (default).\n"
-                            "dramabox_wrapper: use the original DramaBox warm TTSServer path for closer OG behavior."
+                            "clip_loader: Comfy CLIP/GGUF-friendly path with strong VRAM management.\n"
+                            "dramabox_wrapper: use the original DramaBox warm TTSServer path for closer OG behavior.\n"
+                            "Default follows Settings > DramaBox > Generation > Default to DramaBox Wrapper (OG mode).\n"
+                            "Wrapper LoRA support: supports LoRA stacks and strengths.\n"
+                            "Wrapper side effects: ComfyUI cannot fully manage wrapper VRAM."
                         ),
                     },
                 ),
@@ -282,7 +291,7 @@ class DramaBoxOptions:
         valid_generation_modes = {"clip_loader", "dramabox_wrapper"}
         generation_mode = str(generation_mode).strip().lower()
         if generation_mode not in valid_generation_modes:
-            generation_mode = "clip_loader"
+            generation_mode = _default_generation_mode()
 
         options = {
             "steps": steps,

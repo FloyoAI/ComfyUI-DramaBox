@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import replace
 import gc
 import logging
@@ -39,6 +39,11 @@ from ltx_pipelines.utils.helpers import (
     post_process_latent,
 )
 from ltx_pipelines.utils.model_ledger import ModelLedger
+
+try:
+    from ltx_core.layer_streaming import LayerStreamingWrapper
+except Exception:
+    LayerStreamingWrapper = None
 
 _M = TypeVar("_M", bound=torch.nn.Module)
 _T = TypeVar("_T")
@@ -209,6 +214,40 @@ def gpu_model(model: _M) -> Iterator[_M]:
             torch.cuda.synchronize()
         model.to("meta")
         cleanup_memory()
+
+
+@contextmanager
+def _streaming_model(
+    model: _M,
+    layers_attr: str,
+    target_device: torch.device,
+    prefetch_count: int,
+) -> Iterator[_M]:
+    """Yield a streaming-wrapped model and free host/device memory on exit."""
+    if LayerStreamingWrapper is None:
+        with gpu_model(model) as wrapped:
+            yield wrapped
+        return
+
+    wrapped = LayerStreamingWrapper(
+        model,
+        layers_attr=layers_attr,
+        target_device=target_device,
+        prefetch_count=prefetch_count,
+    )
+    try:
+        yield wrapped  # type: ignore[misc]
+    finally:
+        wrapped.teardown()
+        wrapped.to("meta")
+        cleanup_memory()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(device=target_device)
+            try:
+                if hasattr(torch._C, "_host_emptyCache"):
+                    torch._C._host_emptyCache()
+            except Exception:
+                logger.warning("Host empty cache cleanup failed; ignoring.", exc_info=True)
 
 
 class AudioDecoder:
@@ -489,6 +528,16 @@ class PromptEncoder:
         )
         return GemmaTextEncoder(model=hf_model, tokenizer=tokenizer, dtype=self._dtype)
 
+    def _text_encoder_ctx(self, streaming_prefetch_count: int | None) -> AbstractContextManager:
+        if streaming_prefetch_count is not None:
+            return _streaming_model(
+                self._text_encoder_builder.build(device=torch.device("cpu"), dtype=self._dtype).eval(),
+                layers_attr="model.model.language_model.layers",
+                target_device=self._device,
+                prefetch_count=streaming_prefetch_count,
+            )
+        return gpu_model(self._text_encoder_builder.build(device=self._device, dtype=self._dtype).eval())
+
     def __call__(
         self,
         prompts: list[str],
@@ -498,27 +547,29 @@ class PromptEncoder:
         enhance_prompt_seed: int = 42,
         streaming_prefetch_count: int | None = None,
     ):
-        del streaming_prefetch_count
-
         _ensure_rope_factor_compat()
 
         if self._warm and self._warm_text_encoder is not None and self._warm_embeddings_processor is not None:
             return self._encode(prompts, self._warm_text_encoder, self._warm_embeddings_processor,
                                 enhance_first_prompt, enhance_prompt_image, enhance_prompt_seed)
 
-        with gpu_model(self._text_encoder_builder.build(device=self._device, dtype=self._dtype).eval()) as text_encoder, gpu_model(
+        with self._text_encoder_ctx(streaming_prefetch_count) as text_encoder:
+            prompts_local = list(prompts)
+            if enhance_first_prompt and prompts_local:
+                prompts_local[0] = generate_enhanced_prompt(
+                    text_encoder,
+                    prompts_local[0],
+                    enhance_prompt_image,
+                    seed=enhance_prompt_seed,
+                )
+            raw_outputs = [text_encoder.encode(p) for p in prompts_local]
+
+        with gpu_model(
             self._prepare_embeddings_processor(
                 self._embeddings_processor_builder.build(device=torch.device("cpu"), dtype=self._dtype)
             )
         ) as embeddings_processor:
-            return self._encode(
-                prompts,
-                text_encoder,
-                embeddings_processor,
-                enhance_first_prompt,
-                enhance_prompt_image,
-                enhance_prompt_seed,
-            )
+            return [embeddings_processor.process_hidden_states(hs, mask) for hs, mask in raw_outputs]
 
     @staticmethod
     def _encode(prompts, text_encoder, embeddings_processor, enhance_first_prompt, enhance_prompt_image, enhance_prompt_seed):

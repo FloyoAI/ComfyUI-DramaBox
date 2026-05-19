@@ -52,13 +52,6 @@ def _default_generation_mode() -> str:
     return "dramabox_wrapper" if _get_dramabox_bool_setting("DramaBox.defaultWrapperMode", False) else "clip_loader"
 
 
-def _normalize_attention_policy(value) -> str:
-    """Normalize attention policy labels to the UI's canonical option keys."""
-    key = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
-    valid = {"auto", "flash_attn", "spda", "default"}
-    return key if key in valid else "auto"
-
-
 class DramaBoxOptions:
     """Advanced generation options for DramaBox TTS."""
 
@@ -283,7 +276,9 @@ class DramaBoxOptions:
         if post_generate_model_policy not in valid_policies:
             post_generate_model_policy = _default_offload_policy()
 
-        attention_policy = _normalize_attention_policy(attention_policy)
+        valid_attention_policies = {"auto", "flash-attn", "spda", "default"}
+        if attention_policy not in valid_attention_policies:
+            attention_policy = "auto"
 
         valid_generation_modes = {"clip_loader", "dramabox_wrapper"}
         generation_mode = str(generation_mode).strip().lower()

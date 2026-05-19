@@ -335,15 +335,21 @@ def _load_models(device, attention_policy: str = "auto") -> dict:
     """
     import comfy.model_management as mm
 
-    normalized_attention_policy = _normalize_attention_policy(attention_policy)
-    if not normalized_attention_policy:
+    policy_map = {
+        "auto": "best_available",
+        "flash-attn": "force_fa2",
+        "spda": "force_sdpa",
+        "default": "force_default",
+    }
+    policy_key = str(attention_policy).strip().lower()
+    if policy_key not in policy_map:
         logger.warning(
-            "[DramaBox] Unknown attention policy '%s' - using best_available",
+            "[DramaBox] Unknown attention policy '%s' - using auto",
             attention_policy,
         )
         attention_policy = "best_available"
     else:
-        attention_policy = normalized_attention_policy
+        attention_policy = policy_map[policy_key]
 
     cache_key = f"{device}|{attention_policy}"
     if cache_key in _LOADED_MODELS:
@@ -986,18 +992,6 @@ def _normalize_generation_mode(mode) -> str:
     if mode in {"clip_loader", "dramabox_wrapper"}:
         return mode
     return "clip_loader"
-
-
-def _normalize_attention_policy(policy) -> str:
-    """Normalize UI attention policy labels to internal canonical values."""
-    key = str(policy or "").strip().lower().replace("-", "_").replace(" ", "_")
-    aliases = {
-        "auto": "best_available",
-        "flash_attn": "force_fa2",
-        "spda": "force_sdpa",
-        "default": "force_default",
-    }
-    return aliases.get(key, "")
 
 
 def _default_generation_mode() -> str:

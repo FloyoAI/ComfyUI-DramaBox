@@ -89,34 +89,73 @@ Voice LoRAs for DramaBox can be trained with **[Voice Clone Studio — DramaBox 
 
 ## Installation
 
-1. Navigate to your ComfyUI custom nodes directory:
-   ```
-   cd ComfyUI/custom_nodes/
-   ```
-2. Clone this repository:
-   ```bash
-   git clone https://github.com/FranckyB/ComfyUI-DramaBox.git
-   ```
-3. Activate your ComfyUI virtual environment:
-   Windows (cmd):
-   ```bat
-   ..\ComfyUI\venv\Scripts\activate
-   ```
-   Linux/macOS (bash/zsh):
-   ```bash
-   source ../ComfyUI/venv/bin/activate
-   ```
-4. Enter the repository:
-   ```bash
-   cd ComfyUI-DramaBox
-   ```
+Follow these steps:
 
-5. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+### 1) Add DramaBox to `custom_nodes`
 
-6. On first run, the node will automatically download DramaBox model weights into `ComfyUI/models/dramabox/`.
+Open a terminal in your ComfyUI `custom_nodes` folder, then run:
+
+```bash
+git clone https://github.com/FranckyB/ComfyUI-DramaBox.git
+```
+
+### 2) Install requirements with the SAME Python ComfyUI uses
+
+Choose **one** option below that matches your ComfyUI install.
+
+#### A) ComfyUI Windows Portable
+
+1. Open your `ComfyUI_windows_portable` folder.
+2. Open a terminal in that folder.
+3. Run:
+
+```bat
+python_embeded\python.exe -m pip install -r ComfyUI\custom_nodes\ComfyUI-DramaBox\requirements.txt
+```
+
+(If your folder is named `python_embedded`, use that instead of `python_embeded`.)
+
+#### B) ComfyUI Desktop
+
+1. Open the folder where ComfyUI Desktop is installed.
+2. Open a terminal in that folder.
+3. Run (adjust the path if your layout differs):
+
+```bat
+python\python.exe -m pip install -r ComfyUI\custom_nodes\ComfyUI-DramaBox\requirements.txt
+```
+
+#### C) Manual Python / venv install
+
+1. Open a terminal in your ComfyUI folder.
+2. Activate the same environment you use to launch ComfyUI.
+3. Install the requirements:
+
+**Windows (cmd):**
+
+```bat
+cd C:\path\to\ComfyUI
+venv\Scripts\activate
+pip install -r custom_nodes\ComfyUI-DramaBox\requirements.txt
+```
+
+**Linux / macOS (bash/zsh):**
+
+```bash
+cd /path/to/ComfyUI
+source venv/bin/activate
+pip install -r custom_nodes/ComfyUI-DramaBox/requirements.txt
+```
+
+### 3) Restart ComfyUI
+
+After restart, search for `DramaBox TTS` in the node menu.
+
+### Quick troubleshooting
+
+- If install fails, check that the requirements path is correct.
+- If ComfyUI starts but node is missing, confirm folder is `custom_nodes/ComfyUI-DramaBox` (not nested like `ComfyUI-DramaBox-main/ComfyUI-DramaBox`).
+- If `pip` command installs to the wrong place, you are likely using a different Python than ComfyUI. Re-run using option A, B, or your active venv Python.
 
 ## Changelog
 

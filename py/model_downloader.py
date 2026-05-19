@@ -251,7 +251,7 @@ def get_model_path(name, cache_dir=None):
         migrate_old_layout(root)
         candidate = root / "dramabox" / local_name
         if candidate.is_file():
-            logger.info(f"[DramaBox] Found {name} locally: {candidate}")
+            logger.debug(f"[DramaBox] Found {name} locally: {candidate}")
             return str(candidate)
 
     dramabox_dir = models_dir / "dramabox"
@@ -301,7 +301,7 @@ def get_gemma_path(cache_dir=None):
     local_dir = models_dir / "dramabox" / gemma_name
 
     if local_dir.is_dir() and any(local_dir.iterdir()):
-        logger.info(f"[DramaBox] Found Gemma locally: {local_dir}")
+        logger.debug(f"[DramaBox] Found Gemma locally: {local_dir}")
         return str(local_dir)
 
     local_dir.mkdir(parents=True, exist_ok=True)

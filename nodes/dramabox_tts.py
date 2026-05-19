@@ -323,7 +323,7 @@ class _DramaBoxTextBundle(torch.nn.Module):
         self.embeddings_processor = embeddings_processor
 
 
-def _load_models(device, attention_policy: str = "best_available") -> dict:
+def _load_models(device, attention_policy: str = "auto") -> dict:
     """Load the audio VAE, transformer, and audio decoder with CPU-offload.
 
     All components are moved to GPU per-stage via mm.load_models_gpu().
@@ -335,24 +335,19 @@ def _load_models(device, attention_policy: str = "best_available") -> dict:
     """
     import comfy.model_management as mm
 
-    valid_attention_policies = {
-        "best_available",
-        "checkpoint_config",
-        "force_fa2",
-        "force_sdpa",
-        "force_default",
-    }
-    attention_policy = str(attention_policy).strip().lower()
-    if attention_policy not in valid_attention_policies:
+    normalized_attention_policy = _normalize_attention_policy(attention_policy)
+    if not normalized_attention_policy:
         logger.warning(
             "[DramaBox] Unknown attention policy '%s' - using best_available",
             attention_policy,
         )
         attention_policy = "best_available"
+    else:
+        attention_policy = normalized_attention_policy
 
     cache_key = f"{device}|{attention_policy}"
     if cache_key in _LOADED_MODELS:
-        logger.info("[DramaBox] Using cached models.")
+        logger.debug("[DramaBox] Using cached models.")
         cached = _LOADED_MODELS[cache_key]
         if "attention_backend" not in cached:
             cached["attention_backend"] = "unknown"
@@ -368,14 +363,14 @@ def _load_models(device, attention_policy: str = "best_available") -> dict:
     # -- Resolve weight paths (local-first via patched model_downloader) -------
     from model_downloader import get_model_path
     models_dir = _get_models_dir()
-    logger.info("[DramaBox] Resolving model weights…")
+    logger.debug("[DramaBox] Resolving model weights...")
     ckpt_transformer = get_model_path("transformer",      cache_dir=models_dir)
     ckpt_audio       = get_model_path("audio_components", cache_dir=models_dir)
 
     from dramabox_ltx_compat import AudioConditioner, AudioDecoder
 
     # ── 1. AudioConditioner (VAE encoder) — load to CPU ──────────────────────
-    logger.info("[DramaBox] Loading AudioConditioner (CPU)…")
+    logger.debug("[DramaBox] Loading AudioConditioner (CPU)...")
     try:
         audio_conditioner = AudioConditioner(
             checkpoint_path=ckpt_audio,
@@ -394,7 +389,7 @@ def _load_models(device, attention_policy: str = "best_available") -> dict:
     mm.soft_empty_cache()
 
     # ── 2. Transformer (LTX audio-only DiT) — build on CPU ───────────────────
-    logger.info("[DramaBox] Loading Transformer (CPU)…")
+    logger.debug("[DramaBox] Loading Transformer (CPU)...")
     from safetensors import safe_open
     from ltx_core.loader.registry import DummyRegistry
     from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
@@ -470,7 +465,7 @@ def _load_models(device, attention_policy: str = "best_available") -> dict:
         logger.warning("[DramaBox] Could not resolve checkpoint attention_type='%s' - using default", _ckpt_attn_name)
 
     _attn_name = getattr(selected_attention, "value", str(selected_attention))
-    logger.info(
+    logger.debug(
         "[DramaBox] Attention backend: %s (%s) [policy=%s]",
         _attn_source,
         _attn_name,
@@ -537,11 +532,11 @@ def _load_models(device, attention_policy: str = "best_available") -> dict:
             .eval()
         )
     n_params = sum(p.numel() for p in transformer.parameters()) / 1e9
-    logger.info("[DramaBox] Transformer: %.1fB params", n_params)
+    logger.debug("[DramaBox] Transformer: %.1fB params", n_params)
     mm.soft_empty_cache()
 
     # ── 3. AudioDecoder (VAE decoder + vocoder) — load to CPU ────────────────
-    logger.info("[DramaBox] Loading AudioDecoder (CPU)…")
+    logger.debug("[DramaBox] Loading AudioDecoder (CPU)...")
     try:
         audio_decoder = AudioDecoder(
             checkpoint_path=ckpt_audio,
@@ -584,7 +579,7 @@ def _load_models(device, attention_policy: str = "best_available") -> dict:
         "attention_policy": attention_policy,
     }
     _LOADED_MODELS[cache_key] = model
-    logger.info("[DramaBox] Non-text components loaded (audio VAE, transformer, decoder).")
+    logger.debug("[DramaBox] Non-text components loaded (audio VAE, transformer, decoder).")
     return model
 
 
@@ -608,7 +603,7 @@ def _load_text_encoder(device):
     for k in stale:
         del _LOADED_TEXT_ENCODER[k]
 
-    print(f"[DramaBox] Loading text encoder: {os.path.basename(gemma_path)}")
+    logger.debug("[DramaBox] Loading text encoder: %s", os.path.basename(gemma_path))
     clip_device = "default"  # follow Comfy's default text-encoder device policy
     (clip,) = DramaBoxTextEncoderLoader().load(gemma_path, clip_device)
     _LOADED_TEXT_ENCODER[cache_key] = clip
@@ -991,6 +986,18 @@ def _normalize_generation_mode(mode) -> str:
     if mode in {"clip_loader", "dramabox_wrapper"}:
         return mode
     return "clip_loader"
+
+
+def _normalize_attention_policy(policy) -> str:
+    """Normalize UI attention policy labels to internal canonical values."""
+    key = str(policy or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "auto": "best_available",
+        "flash_attn": "force_fa2",
+        "spda": "force_sdpa",
+        "default": "force_default",
+    }
+    return aliases.get(key, "")
 
 
 def _default_generation_mode() -> str:
@@ -1568,8 +1575,7 @@ class DramaBoxTTS:
         used_prompt = prompt if (use_prompt_input and prompt) else text
 
         vr_summary = _summarize_voice_ref(voice_ref)
-        logger.info("[DramaBox] voice_ref input summary: %s", vr_summary)
-        print(f"[DramaBox] voice_ref input summary: {vr_summary}")
+        logger.debug("[DramaBox] voice_ref input summary: %s", vr_summary)
 
         # Notify the frontend so it can display the active prompt in the widget
         if unique_id is not None and _PromptServer is not None:
@@ -1584,12 +1590,12 @@ class DramaBoxTTS:
         opts = options or {}
         normalized_lora_stack = _normalize_lora_stack(lora_stack)
         if lora_stack and not normalized_lora_stack:
-            print("[DramaBox] Warning: lora_stack input was provided but no valid entries were parsed.")
+            logger.warning("[DramaBox] lora_stack input was provided but no valid entries were parsed.")
         elif normalized_lora_stack:
-            print(f"[DramaBox] LoRA stack parsed: {len(normalized_lora_stack)} adapter(s)")
+            logger.debug("[DramaBox] LoRA stack parsed: %d adapter(s)", len(normalized_lora_stack))
 
         generation_mode = _normalize_generation_mode(opts.get("generation_mode", _default_generation_mode()))
-        attention_policy = str(opts.get("attention_policy", "best_available"))
+        attention_policy = str(opts.get("attention_policy", "auto"))
         ref_duration: float  = opts.get("ref_duration", 10.0)
         gen_duration: float  = opts.get("gen_duration", 0.0)
         duration_mult: float = opts.get("duration_multiplier", 1.1)
@@ -1614,18 +1620,16 @@ class DramaBoxTTS:
 
             tmp_voice_path = _voice_ref_to_temp_wav(voice_ref)
             if tmp_voice_path:
-                logger.info("[DramaBox] wrapper voice_ref temp path ready")
-                print("[DramaBox] wrapper voice_ref: temp wav ready")
+                logger.debug("[DramaBox] wrapper voice_ref temp path ready")
             else:
-                logger.info("[DramaBox] wrapper voice_ref missing/invalid; running without reference")
-                print("[DramaBox] wrapper voice_ref: none (running without reference)")
+                logger.debug("[DramaBox] wrapper voice_ref missing/invalid; running without reference")
             try:
                 if offload_policy in {"offload_to_cpu", "offload"}:
                     logger.info("[DramaBox] dramabox_wrapper + offload policy -> one-shot low-memory run")
 
                     lora_entries = _resolve_wrapper_loras(normalized_lora_stack)
                     if normalized_lora_stack and not lora_entries:
-                        print("[DramaBox] Warning: no valid wrapper LoRA entries resolved for one-shot run")
+                        logger.warning("[DramaBox] no valid wrapper LoRA entries resolved for one-shot run")
 
                     _release_og_server(device)
                     waveform, sample_rate = _run_og_low_memory_once(
@@ -1651,16 +1655,15 @@ class DramaBoxTTS:
                             lora_path = _resolve_lora_path(lora_name)
                             if lora_path is None:
                                 logger.warning("[DramaBox] LoRA not found, skipping: %s", lora_name)
-                                print(f"[DramaBox] Wrapper LoRA missing: {lora_name}")
                                 continue
                             deltas = _apply_lora_deltas(server._velocity_model, lora_path, float(strength_model))
                             _applied_deltas.extend(deltas)
-                            print(
+                            logger.debug(
                                 f"[DramaBox] Wrapper LoRA applied: {os.path.basename(lora_path)} "
                                 f"(strength={float(strength_model):.2f}, params={len(deltas)})"
                             )
                             if not deltas:
-                                print(
+                                logger.warning(
                                     f"[DramaBox] Warning: no matching transformer params found for "
                                     f"{os.path.basename(lora_path)}"
                                 )
@@ -1705,7 +1708,7 @@ class DramaBoxTTS:
         # large model occupies VRAM at a time; ComfyUI evicts the previous
         # stage's weights to CPU automatically.
         model = _load_models(device, attention_policy=attention_policy)
-        logger.info(
+        logger.debug(
             "[DramaBox] Attention backend in use (this run): %s (%s) [policy=%s]",
             model.get("attention_backend_source", "unknown"),
             model.get("attention_backend", "unknown"),
@@ -1745,7 +1748,7 @@ class DramaBoxTTS:
         else:
             est_base = estimate_speech_duration(used_prompt, speed)
             gen_dur = max(3.0, round(est_base * duration_mult + _AUTO_DURATION_SAFETY_PAD_SEC, 1))
-            logger.info(
+            logger.debug(
                 "[DramaBox] Auto duration: base=%.1fs, multiplier=%.2f, speed=%.2f, safety=%.1fs -> target=%.1fs",
                 est_base,
                 duration_mult,
@@ -1759,7 +1762,7 @@ class DramaBoxTTS:
         pixel_shape  = VideoPixelShape(batch=1, frames=n_frames, height=64, width=64, fps=fps)
         target_shape = AudioLatentShape.from_video_pixel_shape(pixel_shape)
         audio_tools  = AudioLatentTools(patchifier=patchifier, target_shape=target_shape)
-        logger.info("[DramaBox] target: %.1fs → %d frames", gen_dur, n_frames)
+        logger.debug("[DramaBox] target: %.1fs -> %d frames", gen_dur, n_frames)
 
         # ── 2. Initial latent state ──────────────────────────────────────
         state = audio_tools.create_initial_state(device=device, dtype=torch_dtype)
@@ -1785,14 +1788,10 @@ class DramaBoxTTS:
                 if voice is None:
                     raise ValueError("decode_audio_from_file returned no audio")
 
-                logger.info(
+                logger.debug(
                     "[DramaBox] voice_ref decoded: sr=%d, waveform_shape=%s",
                     int(voice.sampling_rate),
                     tuple(voice.waveform.shape),
-                )
-                print(
-                    "[DramaBox] voice_ref decoded: "
-                    f"sr={int(voice.sampling_rate)}, shape={tuple(voice.waveform.shape)}"
                 )
 
                 w = voice.waveform
@@ -1812,30 +1811,25 @@ class DramaBoxTTS:
                 voice = Audio(waveform=w, sampling_rate=voice.sampling_rate)
                 pre_tokens = int(state.latent.shape[1])
                 ref_latent = audio_cond(lambda enc: vae_encode_audio(voice, enc, None))
-                logger.info(
+                logger.debug(
                     "[DramaBox] reference latent encoded: shape=%s, dtype=%s, device=%s",
                     tuple(ref_latent.shape),
                     ref_latent.dtype,
                     ref_latent.device,
                 )
-                print(f"[DramaBox] reference latent shape: {tuple(ref_latent.shape)}")
                 cond = AudioConditionByReferenceLatent(
                     latent=ref_latent.to(device, torch_dtype), strength=1.0
                 )
                 state = cond.apply_to(state, audio_tools)
                 post_tokens = int(state.latent.shape[1])
-                logger.info(
+                logger.debug(
                     "[DramaBox] conditioning applied: latent tokens %d -> %d",
                     pre_tokens,
                     post_tokens,
                 )
-                print(
-                    f"[DramaBox] conditioning applied: latent tokens {pre_tokens} -> {post_tokens}"
-                )
-                logger.info("[DramaBox] Voice reference encoded (wrapper-style decode path).")
+                logger.debug("[DramaBox] Voice reference encoded (wrapper-style decode path).")
             except Exception as exc:
                 logger.warning("[DramaBox] voice_ref failed (%s) — running without it", exc)
-                print(f"[DramaBox] Warning: voice_ref conditioning failed, continuing without it: {exc}")
 
         # ── 4. Add noise ────────────────────────────────────────────────
         gen = torch.Generator(device=device).manual_seed(seed)
@@ -1844,7 +1838,7 @@ class DramaBoxTTS:
         # ── 5. Encode text prompts ───────────────────────────────────────
         # Use DramaBoxTEModel.encode_token_weights() for both backends so the
         # Comfy node path follows one shared, DramaBox-compatible routine.
-        logger.info("[DramaBox] Encoding prompts…")
+        logger.debug("[DramaBox] Encoding prompts...")
         mm.load_models_gpu([_clip_enc.patcher])
         te_model = _clip_enc.cond_stage_model          # DramaBoxTEModel
         te_model.set_clip_options({"execution_device": _clip_enc.patcher.load_device})
@@ -1896,16 +1890,15 @@ class DramaBoxTTS:
                 lora_path = _resolve_lora_path(lora_name)
                 if lora_path is None:
                     logger.warning("[DramaBox] LoRA not found, skipping: %s", lora_name)
-                    print(f"[DramaBox] LoRA missing: {lora_name}")
                     continue
                 deltas = _apply_lora_deltas(transformer, lora_path, float(strength_model))
                 _applied_deltas.extend(deltas)
-                print(
+                logger.debug(
                     f"[DramaBox] LoRA applied: {os.path.basename(lora_path)} "
                     f"(strength={float(strength_model):.2f}, params={len(deltas)})"
                 )
                 if not deltas:
-                    print(
+                    logger.warning(
                         f"[DramaBox] Warning: no matching transformer params found for "
                         f"{os.path.basename(lora_path)}"
                     )
@@ -1964,7 +1957,7 @@ class DramaBoxTTS:
 
         # ── 9. Decode latents → waveform ────────────────────────────────
         mm.load_models_gpu(model["dec_patchers"])
-        logger.info("[DramaBox] Decoding…")
+        logger.debug("[DramaBox] Decoding...")
         decoded = decoder(latent)
 
         mm.soft_empty_cache()
@@ -1978,10 +1971,10 @@ class DramaBoxTTS:
         elapsed = time.time() - t_total
 
         if offload_policy == "offload_to_cpu":
-            logger.info("[DramaBox] offload_policy=offload_to_cpu")
+            logger.debug("[DramaBox] offload_policy=offload_to_cpu")
             _offload_dramabox_models_to_cpu()
         elif offload_policy == "offload":
-            logger.info("[DramaBox] offload_policy=offload")
+            logger.debug("[DramaBox] offload_policy=offload")
             _unload_dramabox_models()
 
         return ({"waveform": waveform, "sample_rate": sample_rate},)

@@ -52,6 +52,13 @@ def _default_generation_mode() -> str:
     return "dramabox_wrapper" if _get_dramabox_bool_setting("DramaBox.defaultWrapperMode", False) else "clip_loader"
 
 
+def _normalize_attention_policy(value) -> str:
+    """Normalize attention policy labels to the UI's canonical option keys."""
+    key = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    valid = {"auto", "flash_attn", "spda", "default"}
+    return key if key in valid else "auto"
+
+
 class DramaBoxOptions:
     """Advanced generation options for DramaBox TTS."""
 
@@ -219,16 +226,15 @@ class DramaBoxOptions:
                     },
                 ),
                 "attention_policy": (
-                    ["best_available", "checkpoint_config", "force_fa2", "force_sdpa", "force_default"],
+                    ["auto", "flash-attn", "spda", "default"],
                     {
-                        "default": "best_available",
+                        "default": "auto",
                         "advanced": True,
                         "tooltip": (
                             "Transformer attention backend policy:\n"
-                            "best_available: auto-select fastest supported backend (recommended).\n"
-                            "checkpoint_config: use attention_type from checkpoint metadata.\n"
-                            "force_fa2 / force_sdpa / force_default: force a backend when available;\n"
-                            "falls back to checkpoint_config if unavailable."
+                            "auto: auto-select fastest supported backend (recommended).\n"
+                            "flash-attn / spda / default: force a backend when available;\n"
+                            "falls back automatically when unavailable."
                         ),
                     },
                 ),
@@ -270,23 +276,14 @@ class DramaBoxOptions:
         speed: float = 1.0,
         ref_duration: float = 10.0,
         post_generate_model_policy: str = "",
-        attention_policy: str = "best_available",
+        attention_policy: str = "auto",
         generation_mode: str = "clip_loader",
     ):
         valid_policies = {"keep_loaded", "offload_to_cpu", "offload"}
         if post_generate_model_policy not in valid_policies:
             post_generate_model_policy = _default_offload_policy()
 
-        valid_attention_policies = {
-            "best_available",
-            "checkpoint_config",
-            "force_fa2",
-            "force_sdpa",
-            "force_default",
-        }
-        attention_policy = str(attention_policy).strip().lower()
-        if attention_policy not in valid_attention_policies:
-            attention_policy = "best_available"
+        attention_policy = _normalize_attention_policy(attention_policy)
 
         valid_generation_modes = {"clip_loader", "dramabox_wrapper"}
         generation_mode = str(generation_mode).strip().lower()

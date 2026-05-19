@@ -793,6 +793,14 @@ class DramaBoxTextEncoderLoader:
                 clip.patcher = gguf_model_patcher.clone(clip.patcher)
             except Exception as e:
                 logger.debug("[DramaBox] GGUF patcher clone skipped: %s", e)
+
+        # Keep source metadata so downstream nodes can display the model name.
+        try:
+            clip.dramabox_model_path = gemma_path
+            clip.dramabox_model_name = os.path.basename(gemma_path)
+        except Exception:
+            pass
+
         return (clip,)
 
     def _load_bnb(self, bnb_root: str, audio_path: str, model_options: dict):
@@ -848,6 +856,14 @@ class DramaBoxTextEncoderLoader:
             state_dict=clip_data,
             model_options=model_options,
         )
+
+        # Keep source metadata so downstream nodes can display the model name.
+        try:
+            clip.dramabox_model_path = bnb_root
+            clip.dramabox_model_name = os.path.basename(os.path.normpath(bnb_root))
+        except Exception:
+            pass
+
         return (clip,)
 
     @staticmethod
@@ -884,5 +900,5 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "DramaBoxTextEncoderLoader": "DramaBox Text Encoder Loader",
+    "DramaBoxTextEncoderLoader": "DramaBox CLIP Loader",
 }

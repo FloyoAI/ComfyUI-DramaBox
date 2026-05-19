@@ -164,7 +164,7 @@ app.registerExtension({
             defaultValue: "",
             tooltip:
                 "Gemma filename (.safetensors/.gguf) in text_encoders. " +
-                "Leave blank to auto-use gemma_3_12B_it_fp4_mixed.safetensors. " +
+                "Leave blank to auto-use gemma_3_12B_it_fp4_mixed. " +
                 "Use DramaBox CLIP Loader to override per workflow.",
         },
         {
@@ -179,15 +179,14 @@ app.registerExtension({
         },
         {
             id: "DramaBox.defaultWrapperMode",
-            name: "Use DramaBox Wrapper mode by default",
+            name: "Use DramaBox Wrapper",
             category: ["DramaBox", "Generation"],
             type: "boolean",
             defaultValue: false,
             tooltip:
-                "ON: use DramaBox Wrapper by default (Options can override). " +
-                "OFF: use clip_loader by default (best VRAM control). " +
-                "Side effect: ComfyUI can not release VRAM automatically; " +
-                "Use offload policy or the DramaBox Unload node.",
+                "Uses the DramaBox Wrapper as default (Option node can override). " +
+                "Bypasses ComfyUI's memory management. " +
+                "Useful for exploration or testing purposes.",
         },
     ],
 });

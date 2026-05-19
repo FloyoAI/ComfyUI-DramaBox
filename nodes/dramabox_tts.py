@@ -602,6 +602,7 @@ def _load_text_encoder(device):
     cache_key = f"{device}:{gemma_path}"
 
     if cache_key in _LOADED_TEXT_ENCODER:
+        logger.info("[DramaBox] Text encoder: %s (cached)", os.path.basename(gemma_path))
         return _LOADED_TEXT_ENCODER[cache_key]
 
     # Evict any stale entry for this device (different path)
@@ -609,7 +610,7 @@ def _load_text_encoder(device):
     for k in stale:
         del _LOADED_TEXT_ENCODER[k]
 
-    logger.debug("[DramaBox] Loading text encoder: %s", os.path.basename(gemma_path))
+    logger.info("[DramaBox] Text encoder: %s", os.path.basename(gemma_path))
     clip_device = "default"  # follow Comfy's default text-encoder device policy
     (clip,) = DramaBoxTextEncoderLoader().load(gemma_path, clip_device)
     _LOADED_TEXT_ENCODER[cache_key] = clip
@@ -1519,7 +1520,7 @@ class DramaBoxTTS:
                     "CLIP",
                     {
                         "lazy": True,
-                        "tooltip": "Pre-loaded text encoder from DramaBox Text Encoder Loader. Used only in clip_loader mode.",
+                        "tooltip": "Pre-loaded text encoder from DramaBox CLIP Loader. Used only in clip_loader mode.",
                     },
                 ),
             },
@@ -1529,8 +1530,14 @@ class DramaBoxTTS:
         }
 
     @classmethod
-    def IS_CHANGED(cls, seed, use_prompt_input=False, text="", prompt=None, **kwargs):
-        return (seed, use_prompt_input, prompt)
+    def IS_CHANGED(cls, seed, use_prompt_input=False, text="", prompt=None, options=None, **kwargs):
+        # Cache key should follow the effective prompt source and options.
+        effective_prompt = prompt if (use_prompt_input and prompt is not None) else text
+        try:
+            options_sig = json.dumps(options or {}, sort_keys=True, ensure_ascii=True)
+        except Exception:
+            options_sig = str(options)
+        return (seed, bool(use_prompt_input), effective_prompt, options_sig)
 
     def check_lazy_status(self, seed, use_prompt_input=False, text="", options=None, **kwargs):
         """Request lazy inputs only when they are needed for the current mode."""
@@ -1540,8 +1547,9 @@ class DramaBoxTTS:
         generation_mode = _normalize_generation_mode(
             opts.get("generation_mode", _default_generation_mode())
         )
-        # Only request dramabox_clip when this optional input is actually wired.
-        has_clip_input = kwargs.get("dramabox_clip", None) is not None
+        # For lazy optional inputs, presence in kwargs indicates a connection.
+        # The value may still be unresolved/None at this stage.
+        has_clip_input = "dramabox_clip" in kwargs
         if generation_mode != "dramabox_wrapper" and has_clip_input:
             needed.append("dramabox_clip")
 
@@ -1712,7 +1720,19 @@ class DramaBoxTTS:
         # ── Resolve text encoder (external CLIP or auto-loaded CLIP) ───────────
         # Both paths produce a standard comfy.sd.CLIP — same encoding code runs
         # regardless of whether the user connected a DramaBoxTextEncoderLoader.
-        _clip_enc = dramabox_clip if dramabox_clip is not None else _load_text_encoder(device)
+        if dramabox_clip is not None:
+            clip_name = getattr(dramabox_clip, "dramabox_model_name", None)
+            if not clip_name:
+                clip_path = getattr(dramabox_clip, "dramabox_model_path", None)
+                if isinstance(clip_path, str) and clip_path:
+                    clip_name = os.path.basename(clip_path)
+            if not clip_name:
+                clip_name = "connected DRAMABOX_CLIP"
+
+            logger.info("[DramaBox] Text encoder: %s", clip_name)
+            _clip_enc = dramabox_clip
+        else:
+            _clip_enc = _load_text_encoder(device)
 
         audio_cond  = model["audio_conditioner"]
         transformer = model["transformer"]

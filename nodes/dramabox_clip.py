@@ -693,17 +693,6 @@ class DramaBoxTextEncoderLoader:
                 ),
             },
             "optional": {
-                "encoder_backend": (
-                    ["comfy_clip", "dramabox_bnb_experimental"],
-                    {
-                        "advanced": True,
-                        "tooltip": (
-                            "Backend for text encoding. 'comfy_clip' uses the selected text_encoder file "
-                            "with ComfyUI VRAM management. 'dramabox_bnb_experimental' uses the downloaded "
-                            "unsloth BNB directory when available."
-                        ),
-                    },
-                ),
                 "device": (
                     ["default", "cpu"],
                     {"advanced": True, "tooltip": "Force CPU offload for the text encoder."},
@@ -711,7 +700,7 @@ class DramaBoxTextEncoderLoader:
             },
         }
 
-    def load(self, gemma_model, device="default", encoder_backend="comfy_clip"):
+    def load(self, gemma_model, device="default"):
         # ── mirror LTXAVTextEncoderLoader / load_text_encoder_state_dicts ──
         # Accept either a bare filename (from the dropdown) or a full absolute
         # path (when called programmatically from _load_text_encoder).
@@ -730,28 +719,6 @@ class DramaBoxTextEncoderLoader:
         model_options = {}
         if device == "cpu":
             model_options["load_device"] = model_options["offload_device"] = torch.device("cpu")
-
-        # ── Optional BNB mode (explicit opt-in) ──
-        # Do not auto-switch to BNB just because the directory exists; default
-        # behavior should always respect the selected text_encoder file.
-        if encoder_backend == "dramabox_bnb_experimental":
-            bnb_root = _find_bnb_gemma_root()
-            if bnb_root is None:
-                raise FileNotFoundError(
-                    "[DramaBox] encoder_backend=dramabox_bnb_experimental was requested, but "
-                    "the downloaded BNB directory was not found. Run the DramaBox wrapper once "
-                    "or switch encoder_backend to comfy_clip."
-                )
-            try:
-                return self._load_bnb(
-                    bnb_root=bnb_root,
-                    audio_path=audio_path,
-                    model_options=model_options,
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    f"[DramaBox] BNB backend failed to load: {exc}"
-                ) from exc
 
         # ── Safetensors / GGUF mode ──
 

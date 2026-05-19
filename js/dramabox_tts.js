@@ -182,7 +182,7 @@ app.registerExtension({
             name: "Use DramaBox Wrapper mode by default",
             category: ["DramaBox", "Generation"],
             type: "boolean",
-            defaultValue: true,
+            defaultValue: false,
             tooltip:
                 "ON: use DramaBox Wrapper by default (Options can override). " +
                 "OFF: use clip_loader by default (best VRAM control). " +

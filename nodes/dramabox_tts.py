@@ -1516,7 +1516,10 @@ class DramaBoxTTS:
                 ),
                 "dramabox_clip": (
                     "CLIP",
-                    {"tooltip": "Pre-loaded text encoder from DramaBox Text Encoder Loader. Skips internal Gemma loading when connected."},
+                    {
+                        "lazy": True,
+                        "tooltip": "Pre-loaded text encoder from DramaBox Text Encoder Loader. Used only in clip_loader mode.",
+                    },
                 ),
             },
             "hidden": {
@@ -1528,9 +1531,20 @@ class DramaBoxTTS:
     def IS_CHANGED(cls, seed, use_prompt_input=False, text="", prompt=None, **kwargs):
         return (seed, use_prompt_input, prompt)
 
-    def check_lazy_status(self, seed, use_prompt_input=False, text="", **kwargs):
-        """Request the connected prompt only when use_prompt_input is enabled."""
-        return ["prompt"] if use_prompt_input else []
+    def check_lazy_status(self, seed, use_prompt_input=False, text="", options=None, **kwargs):
+        """Request lazy inputs only when they are needed for the current mode."""
+        needed = ["prompt"] if use_prompt_input else []
+
+        opts = options if isinstance(options, dict) else {}
+        generation_mode = _normalize_generation_mode(
+            opts.get("generation_mode", _default_generation_mode())
+        )
+        # Only request dramabox_clip when this optional input is actually wired.
+        has_clip_input = kwargs.get("dramabox_clip", None) is not None
+        if generation_mode != "dramabox_wrapper" and has_clip_input:
+            needed.append("dramabox_clip")
+
+        return needed
 
     # ------------------------------------------------------------------ #
 

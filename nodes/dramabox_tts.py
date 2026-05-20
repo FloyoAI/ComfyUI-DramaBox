@@ -884,28 +884,17 @@ def _is_cuda_oom(exc: RuntimeError) -> bool:
 
 def _build_device_mismatch_message(generation_mode: str, offload_policy: str) -> str:
     return (
-        "[DramaBox] Denoising failed due to mixed CUDA/CPU tensors.\n"
-        "Likely cause: VRAM pressure caused a partial transformer load.\n"
-        f"Current mode: {generation_mode}, post_generate_model_policy: {offload_policy}.\n"
-        "Recommended actions:\n"
-        "1. Set post_generate_model_policy to offload_to_cpu or offload.\n"
-        "2. Avoid keep_loaded on lower VRAM systems.\n"
-        "3. Run DramaBox Unload once, then retry.\n"
-        "4. Close other heavy models/workflows.\n"
-        "5. If needed, use dramabox_wrapper with offload_to_cpu."
+        "[DramaBox] Failed due to CUDA/CPU device mismatch.\n"
+        f"Mode: {generation_mode}, post_generate_model_policy: {offload_policy}."
+        "[DramaBox] Not enough VRAM for this generation. Try offload_to_cpu/offload."
     )
 
 
 def _build_cuda_oom_message(generation_mode: str, offload_policy: str) -> str:
     return (
-        "[DramaBox] Denoising failed due to CUDA out-of-memory (OOM).\n"
-        f"Current mode: {generation_mode}, post_generate_model_policy: {offload_policy}.\n"
-        "Recommended actions:\n"
-        "1. Set post_generate_model_policy to offload_to_cpu or offload.\n"
-        "2. Avoid keep_loaded on lower VRAM systems.\n"
-        "3. Run DramaBox Unload once, then retry.\n"
-        "4. Close other heavy models/workflows.\n"
-        "5. If needed, use dramabox_wrapper with offload_to_cpu."
+        "[DramaBox] Failed due to CUDA out-of-memory (OOM).\n"
+        f"Mode: {generation_mode}, post_generate_model_policy: {offload_policy}."
+        "[DramaBox] Not enough VRAM for this generation. Try offload_to_cpu/offload."
     )
 
 

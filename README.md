@@ -4,6 +4,8 @@ ComfyUI custom nodes for [DramaBox](https://github.com/resemble-ai/DramaBox) —
 
 **Please Note:** DramaBox offers two generation methods. `dramabox_wrapper` runs the original DramaBox pipeline for native behavior, while `clip_loader` uses ComfyUI memory management for a more integrated and reliable workflow. Users wanting to experiment, can enable wrapper mode in Preferences or in the DramaBox Options node.
 
+**VRAM Recommendation:** For the smoothest experience, a **16 GB GPU** is strongly recommended. Lower-VRAM GPUs can still work with aggressive offloading, but may be slower and more prone to out-of-memory errors.
+
 **Users with sufficient VRAM can disable model offloading in Preferences for faster generation.**
 
 ## Nodes

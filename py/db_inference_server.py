@@ -102,7 +102,7 @@ class TTSServer:
         self.full_checkpoint = full_checkpoint or os.environ.get(
             "LTX_FULL_CHECKPOINT", "/mnt/persistent0/manmay/models/ltx23/ltx-2.3-22b-dev.safetensors")
         if gemma_root is None and not os.environ.get("GEMMA_DIR"):
-            from model_downloader import get_gemma_path
+            from dramabox_model_downloader import get_gemma_path
             gemma_root = get_gemma_path()
         self.gemma_root = gemma_root or os.environ["GEMMA_DIR"]
         self.device = torch.device(device)

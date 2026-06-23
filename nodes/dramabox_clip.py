@@ -85,7 +85,7 @@ def _find_bnb_gemma_root() -> "str | None":
         _py_dir = os.path.join(_NODE_DIR, "py")
         if _py_dir not in sys.path:
             sys.path.insert(0, _py_dir)
-        from model_downloader import GEMMA_REPO, _resolve_models_dir
+        from dramabox_model_downloader import GEMMA_REPO, _resolve_models_dir
         models_dir = _resolve_models_dir(None)
         gemma_name = GEMMA_REPO.split("/")[-1]
         candidate = models_dir / "dramabox" / gemma_name
@@ -883,9 +883,9 @@ class DramaBoxTextEncoderLoader:
             best = candidates[0]
             if _score(best)[0] < 2:
                 return best
-        # Last resort: model_downloader path (may trigger a download)
+        # Last resort: dramabox_model_downloader path (may trigger a download)
         try:
-            from model_downloader import get_model_path
+            from dramabox_model_downloader import get_model_path
             p = get_model_path("audio_components")
             if os.path.isfile(p):
                 return p

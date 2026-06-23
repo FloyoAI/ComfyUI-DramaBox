@@ -366,8 +366,8 @@ def _load_models(device, attention_policy: str = "auto") -> dict:
     offload_device = mm.unet_offload_device()   # typically torch.device('cpu')
     torch_dtype = torch.bfloat16
 
-    # -- Resolve weight paths (local-first via patched model_downloader) -------
-    from model_downloader import get_model_path
+    # -- Resolve weight paths (local-first via dramabox_model_downloader) -------
+    from dramabox_model_downloader import get_model_path
     models_dir = _get_models_dir()
     logger.debug("[DramaBox] Resolving model weights...")
     ckpt_transformer = get_model_path("transformer",      cache_dir=models_dir)
@@ -1168,7 +1168,7 @@ def _get_og_server(device):
     _apply_dramabox_wrapper_compat()
 
     from db_inference_server import TTSServer
-    from model_downloader import get_gemma_path, get_model_path
+    from dramabox_model_downloader import get_gemma_path, get_model_path
 
     models_dir = _get_models_dir()
     ckpt_transformer = get_model_path("transformer", cache_dir=models_dir)
@@ -1345,7 +1345,7 @@ def _run_og_low_memory_once(
     import tempfile
     import soundfile as sf
 
-    from model_downloader import get_gemma_path, get_model_path
+    from dramabox_model_downloader import get_gemma_path, get_model_path
 
     models_dir = _get_models_dir()
     ckpt_transformer = get_model_path("transformer", cache_dir=models_dir)
